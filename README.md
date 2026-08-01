@@ -1,5 +1,9 @@
 # CSNETWK-MP
 
 run this in root folder
-python -m server.server
-python -m client.client
+
+In the first terminal:
+```python -m server.server```
+
+In second/separate terminal"
+```python -m client.client```
