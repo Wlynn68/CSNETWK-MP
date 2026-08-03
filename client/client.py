@@ -39,10 +39,12 @@ def main():
     send_pdu(client, player_ready(player, "temp deck", seq_num))
 
     seq_num += 1
-    response = receive_pdu(client)
 
-    print("Server replied:")
-    print(response)
+    while True:
+        command = input()
+
+        if command == "quit":
+            break
 
     client.close()
 

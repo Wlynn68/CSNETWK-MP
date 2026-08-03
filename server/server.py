@@ -40,10 +40,11 @@ def handle_client(conn, addr):
                 players[player_id] = conn
                 print(f"{player_id} is ready.")
 
-            broadcast(game_state_update({},message["seq_num"] + 1))
+                if len(players) == 1:
+                    broadcast(game_state_update({},message["seq_num"] + 1)) # edit parameter
 
-            if len(players) == 2:
-                broadcast(game_state_update("We have 2 players.",message["seq_num"] + 1))
+                elif len(players) == 2:
+                    broadcast(game_state_update({},message["seq_num"] + 1)) # edit parameter
 
         except Exception as e:
             print(e)
