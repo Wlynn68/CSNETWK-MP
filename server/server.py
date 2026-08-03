@@ -31,16 +31,12 @@ def handle_client(conn, addr):
 
             print("Received:", message)
             msg_type = message["type"]
-            player_id = message["state"].split(None, 1)[0] # get player's id
-
-            if msg_type == "GAME_STATE_UPDATE":
-                if player_id in players:
-                    send_pdu(conn, error("DUPLICATE PLAYER", "Player ID already taken", "", message["seq_num"]))
 
             if msg_type == "PING":
                 send_pdu(conn, pong( message["timestamp"], message["seq_num"]))
             
-            elif msg_type == "PLAYER_READY":    
+            elif msg_type == "PLAYER_READY":   
+                player_id = message["player_id"] 
                 players[player_id] = conn
                 print(f"{player_id} is ready.")
 

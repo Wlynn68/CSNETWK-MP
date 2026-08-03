@@ -36,15 +36,13 @@ def main():
 
     player = input("Please input your Player ID: ")
 
-    send_pdu(client, game_state_update(player + " join the server.", seq_num))
+    send_pdu(client, player_ready(player, "temp deck", seq_num))
 
     seq_num += 1
     response = receive_pdu(client)
 
     print("Server replied:")
     print(response)
-
-    send_pdu(client, player_ready(player, "temp deck", seq_num))
 
     client.close()
 
