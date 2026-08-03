@@ -184,10 +184,10 @@ def game_over(winner_id, loser_id, reason):
         "reason":    reason # reason: LIFE_ZERO | DECK_EMPTY | CONCEDE | DISCONNECT
     }
 
-def error(code, message, rejected_action):
+def error(code, message, rejected_action, seq_num):
     return{
         "type":            "ERROR",
-        "seq_num":         14,            # echoes the seq_num of the rejected action when available
+        "seq_num":         seq_num,            # echoes the seq_num of the rejected action when available
         "code":            code,
         "message":         message,
         "rejected_action": rejected_action
