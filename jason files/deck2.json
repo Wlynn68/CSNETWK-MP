@@ -1,0 +1,21 @@
+{
+  "type": "PLAYER_READY",
+  "seq_num": 1,
+  "player_id": "player_2",
+  "deck_list": [
+    "island_001", "island_002", "island_003", "island_004", "island_005",
+    "island_006", "island_007", "island_008", "island_009", "island_010",
+    "plains_001", "plains_002", "plains_003", "plains_004", "plains_005",
+    "plains_006", "plains_007", "plains_008", "plains_009", "plains_010",
+    "sol_ring_001", "sol_ring_002",
+    "ponder_001", "ponder_002", "ponder_003", "ponder_004",
+    "swords_to_plowshares_001", "swords_to_plowshares_002", "swords_to_plowshares_003", "swords_to_plowshares_004",
+    "path_to_exile_001", "path_to_exile_002", "path_to_exile_003", "path_to_exile_004",
+    "counterspell_001", "counterspell_002", "counterspell_003", "counterspell_004",
+    "mana_leak_001", "mana_leak_002",
+    "mother_of_runes_001", "mother_of_runes_002", "mother_of_runes_003", "mother_of_runes_004",
+    "merfolk_looter_001", "merfolk_looter_002",
+    "serra_angel_001", "serra_angel_002",
+    "air_elemental_001", "air_elemental_002"
+  ]
+}

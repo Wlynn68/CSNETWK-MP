@@ -1,0 +1,19 @@
+{
+  "type": "PLAYER_READY",
+  "seq_num": 1,
+  "player_id": "player_1",
+  "deck_list": [
+    "mountain_001", "mountain_002", "mountain_003", "mountain_004", "mountain_005",
+    "mountain_006", "mountain_007", "mountain_008", "mountain_009", "mountain_010",
+    "mountain_011", "mountain_012", "mountain_013", "mountain_014", "mountain_015",
+    "mountain_016", "mountain_017", "mountain_018",
+    "goblin_guide_001", "goblin_guide_002", "goblin_guide_003", "goblin_guide_004",
+    "monastery_swiftspear_001", "monastery_swiftspear_002", "monastery_swiftspear_003", "monastery_swiftspear_004",
+    "lightning_bolt_001", "lightning_bolt_002", "lightning_bolt_003", "lightning_bolt_004",
+    "lava_spike_001", "lava_spike_002", "lava_spike_003", "lava_spike_004",
+    "rift_bolt_001", "rift_bolt_002", "rift_bolt_003", "rift_bolt_004",
+    "incinerate_001", "incinerate_002", "incinerate_003", "incinerate_004",
+    "searing_spear_001", "searing_spear_002", "searing_spear_003", "searing_spear_004",
+    "skullcrack_001", "skullcrack_002", "skullcrack_003", "skullcrack_004"
+  ]
+}
