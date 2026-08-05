@@ -7,6 +7,7 @@ from models.protocol import send_pdu, receive_pdu
 from models.pdu import (
     player_ready, mulligan_choice, cast_spell, priotity_pass,
     play_land, activate_ability, trigger_choice_response,
+    declare_attackers, declare_blockers, assign_damage_order,
 )
 from models.cards import get_card, card_base_id
 from models.card_effects import abilities_for
@@ -216,7 +217,8 @@ def main():
 
     print("\nWaiting for game to start...")
     print("Commands: keep | mulligan | bottom <cards...> | pass | land <card> | "
-          "cast <card> [target] | tap <perm_id> [target] | yes | no | concede | quit")
+          "cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
+          "block <blocker> <attacker>... | order <attacker> <blocker>... | yes | no | concede | quit")
 
     while True:
         try:
@@ -309,6 +311,39 @@ def main():
             send_pdu(client, activate_ability(perm_id, 0, targets, pseq, cost))
             print(f"[SENT] ACTIVATE_ABILITY {perm_id} targets={targets}")
 
+        # ── DECLARE_ATTACKERS ─────────────────────────────────────────
+        elif action == "attack":
+            if len(parts) < 2:
+                print("  Usage: attack <creature_id> [creature_id ...]")
+                continue
+            attackers = [{"creature_id": cid} for cid in parts[1:]]
+            send_pdu(client, declare_attackers(attackers, seq_num))
+            seq_num += 1
+            print(f"[SENT] DECLARE_ATTACKERS attackers={parts[1:]}")
+
+        # ── DECLARE_BLOCKERS ─────────────────────────────────────────
+        elif action == "block":
+            if len(parts) < 3 or len(parts[1:]) % 2 != 0:
+                print("  Usage: block <blocker_id> <attacker_id> [<blocker_id> <attacker_id> ...]")
+                continue
+            blockers = []
+            for i in range(1, len(parts), 2):
+                blockers.append({"creature_id": parts[i], "blocking_id": parts[i+1]})
+            send_pdu(client, declare_blockers(blockers, seq_num))
+            seq_num += 1
+            print(f"[SENT] DECLARE_BLOCKERS blockers={blockers}")
+
+        # ── ASSIGN_DAMAGE_ORDER ────────────────────────────────────────
+        elif action == "order":
+            if len(parts) < 3:
+                print("  Usage: order <attacker_id> <blocker_id> [blocker_id ...]")
+                continue
+            attacker_id = parts[1]
+            blocker_order = parts[2:]
+            send_pdu(client, assign_damage_order(attacker_id, blocker_order, seq_num))
+            seq_num += 1
+            print(f"[SENT] ASSIGN_DAMAGE_ORDER attacker={attacker_id} order={blocker_order}")
+
         # ── CONCEDE ─────────────────────────────────────────────────
         elif action == "concede":
             send_pdu(client, {
@@ -331,7 +366,8 @@ def main():
 
         else:
             print("Commands: keep | mulligan | bottom <cards...> | pass | land <card> | "
-                  "cast <card> <target> | tap <perm_id> | bf | hand | concede | quit")
+                  "cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
+                  "block <blocker> <attacker>... | order <attacker> <blocker>... | bf | hand | concede | quit")
 
     client.close()
 
