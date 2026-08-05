@@ -4,19 +4,20 @@ import random
 
 from models.protocol import receive_pdu, send_pdu
 from models.pdu import game_state_update, error, pong
+from models.cards import all_legal_card_ids, get_card, is_creature
+from server.priority_stack import PriorityStackEngine
 
 HOST = "127.0.0.1"
 PORT = 4444
 
-# ── Global state ──────────────────────────────────────────────────────────────
+# Global state
 clients = []                # connected sockets (max 2)
 players = {}                # player_id -> socket
 ready_data = {}             # player_id -> {"deck": [...]}
 game_data = {}              # player_id -> {"life", "hand", "library", "mulligan_count", "battlefield", "graveyard"}
 mulligan_kept = {}          # player_id -> True once they keep
-last_state_seq = {}         # player_id -> seq_num of the last GAME_STATE_UPDATE sent to them (hand state)
+last_state_seq = {}         # player_id -> seq_num of the last GAME_STATE_UPDATE sent to them
 
-# Game-wide state (protected by lock)
 game_state = "LOBBY"        # LOBBY | GAME_SETUP | MULLIGAN | IN_GAME | GAME_OVER
 server_seq = 0
 lock = threading.Lock()
@@ -25,11 +26,9 @@ mull_lock = threading.Lock()
 # IN_GAME specific state
 turn_number = 0
 active_player = None        # player_id of the current active player
-current_phase = None        # e.g., "UNTAP", "UPKEEP", ...
-stack = []
+current_phase = None
 game_over = False
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+engine = None               # PriorityStackEngine
 
 def next_seq():
     global server_seq
@@ -67,22 +66,7 @@ def get_opponent(pid):
     pids = get_pids()
     return [p for p in pids if p != pid][0]
 
-# ── Deck validation ───────────────────────────────────────────────────────────
-
-LEGAL_CARDS = {
-    "mountain_001", "mountain_002", "mountain_003",
-    "forest_001",   "forest_002",   "forest_003",
-    "island_001",   "island_002",   "island_003",
-    "swamp_001",    "swamp_002",    "swamp_003",
-    "plains_001",   "plains_002",   "plains_003",
-    "goblin_guide_001", "goblin_guide_002",
-    "grizzly_bears_001","grizzly_bears_002",
-    "llanowar_elves_001","llanowar_elves_002",
-    "lightning_bolt_001","lightning_bolt_002",
-    "lightning_bolt_003","lightning_bolt_004",
-    "shock_001","shock_002","shock_003",
-    "counterspell_001","counterspell_002",
-}
+LEGAL_CARDS = all_legal_card_ids()
 
 def validate_deck(deck):
     if not deck:
@@ -94,8 +78,6 @@ def validate_deck(deck):
         return False, f"Unknown card(s): {bad}"
     return True, None
 
-# ── LOBBY helpers ─────────────────────────────────────────────────────────────
-
 def lobby_update():
     waiting = [p for p in players if p not in ready_data]
     return game_state_update({
@@ -104,10 +86,28 @@ def lobby_update():
         "waiting_for":   waiting,
     }, next_seq())
 
-# ── Broadcast GAME_STATE_UPDATE (IN_GAME) ────────────────────────────────────
+def _format_battlefield_for_state(pid: str) -> list[dict]:
+    formatted = []
+    for perm in game_data[pid].get("battlefield", []):
+        card = get_card(perm["card_id"])
+        item = {
+            "id": perm.get("id", perm.get("instance_id")),
+            "tapped": perm.get("tapped", False),
+        }
+        if is_creature(perm["card_id"]):
+            base_p = card.get("power") or 0
+            base_t = card.get("toughness") or 0
+            item.update({
+                "damage": perm.get("damage", 0),
+                "power": base_p + perm.get("pump_power", 0),
+                "toughness": base_t + perm.get("pump_toughness", 0),
+                "summoning_sick": perm.get("summoning_sick", True),
+            })
+        formatted.append(item)
+    return formatted
 
 def broadcast_game_state():
-    """Broadcast a personalized GAME_STATE_UPDATE to both players."""
+    """Broadcast a personalized GAME_STATE_UPDATE to both players (RFC 0001 Section 10.2.2)."""
     pids = get_pids()
     if not pids:
         return
@@ -116,22 +116,21 @@ def broadcast_game_state():
         opp = get_opponent(pid)
         state = {
             "turn": turn_number,
-            "phase": current_phase or "UNTAP",
             "active_player": active_player,
+            "phase": current_phase or "UNTAP",
+            "priority_holder": engine.priority_player if (engine and current_phase not in ("UNTAP", "CLEANUP")) else None,
             "life_totals": {p: game_data[p]["life"] for p in pids},
-            "hand": game_data[pid]["hand"],
+            "stack": engine.stack if engine else [],
+            "battlefield": {p: _format_battlefield_for_state(p) for p in pids},
+            "graveyard": {p: game_data[p].get("graveyard", []) for p in pids},
+            "hand": {pid: game_data[pid]["hand"]},
             "hand_counts": {opp: len(game_data[opp]["hand"])},
             "library_counts": {p: len(game_data[p]["library"]) for p in pids},
-            "battlefield": {p: game_data[p].get("battlefield", []) for p in pids},
-            "graveyard": {p: game_data[p].get("graveyard", []) for p in pids},
-            "stack": stack,
+            "land_played_this_turn": pid in engine.land_played_this_turn if engine else False,
         }
         send_to(pid, game_state_update(state, seq))
 
-# ── GAME_OVER handling ────────────────────────────────────────────────────────
-
 def trigger_game_over(reason, winner_id, loser_id):
-    """Broadcast GAME_OVER and reset to LOBBY."""
     global game_state, game_over
     with lock:
         if game_over:
@@ -150,9 +149,8 @@ def trigger_game_over(reason, winner_id, loser_id):
     reset_to_lobby()
 
 def reset_to_lobby():
-    """Reset all game state, keep TCP connections."""
     global game_state, game_data, mulligan_kept, last_state_seq
-    global turn_number, current_phase, active_player, stack, game_over
+    global turn_number, current_phase, active_player, game_over, engine
 
     with lock:
         game_state = "LOBBY"
@@ -162,50 +160,87 @@ def reset_to_lobby():
         turn_number = 0
         current_phase = None
         active_player = None
-        stack = []
         game_over = False
+        engine = None
         players.clear()
         ready_data.clear()
 
     print("[RESET] Returned to LOBBY state. Send new PLAYER_READY.")
 
-# ── Check win conditions ──────────────────────────────────────────────────────
-
 def check_win_conditions():
-    """Check for LIFE_ZERO or DECK_EMPTY win conditions."""
     pids = get_pids()
     if not pids:
         return False
-
     for pid in pids:
-        # Life total <= 0
         if game_data[pid]["life"] <= 0:
             opp = get_opponent(pid)
             trigger_game_over("LIFE_ZERO", opp, pid)
             return True
-
-        # Library empty (would be checked on draw)
         if len(game_data[pid]["library"]) == 0:
             opp = get_opponent(pid)
             trigger_game_over("DECK_EMPTY", opp, pid)
             return True
-
     return False
 
-# ── Start IN_GAME ─────────────────────────────────────────────────────────────
+class _EngineCtx:
+    game_data = None
+    @staticmethod
+    def get_pids(): return get_pids()
+    @staticmethod
+    def get_opponent(pid): return get_opponent(pid)
+    @staticmethod
+    def next_seq(): return next_seq()
+    @staticmethod
+    def send_to(pid, msg): send_to(pid, msg)
+    @staticmethod
+    def broadcast(msg): broadcast(msg)
+    @staticmethod
+    def broadcast_game_state(): broadcast_game_state()
+    @staticmethod
+    def check_win_conditions(): return check_win_conditions()
+    @staticmethod
+    def trigger_game_over(reason, winner, loser): trigger_game_over(reason, winner, loser)
+    @staticmethod
+    def send_error(conn, code, text, rejected, seq): send_error(conn, code, text, rejected, seq)
+    lock = lock
+
+    @property
+    def active_player(self): return active_player
+    @active_player.setter
+    def active_player(self, value):
+        global active_player
+        active_player = value
+
+    @property
+    def current_phase(self): return current_phase
+    @current_phase.setter
+    def current_phase(self, value):
+        global current_phase
+        current_phase = value
+
+    @property
+    def turn_number(self): return turn_number
+    @turn_number.setter
+    def turn_number(self, value):
+        global turn_number
+        turn_number = value
+
+    @property
+    def game_over(self): return game_over
 
 def start_in_game():
-    """Transition from MULLIGAN to IN_GAME."""
-    global game_state, turn_number, current_phase, active_player, stack, game_over
+    global game_state, turn_number, current_phase, engine, game_over
+
+    ctx = _EngineCtx()
+    ctx.game_data = game_data
+    engine = PriorityStackEngine(ctx)
 
     with lock:
         game_state = "IN_GAME"
         turn_number = 1
         current_phase = "UNTAP"
-        stack = []
         game_over = False
 
-    # Broadcast transition to UNTAP
     broadcast({
         "type": "PHASE_TRANSITION",
         "seq_num": next_seq(),
@@ -215,20 +250,11 @@ def start_in_game():
         "turn": turn_number,
     })
 
-    # Broadcast initial game state
-    broadcast_game_state()
-
-    # Check win conditions (shouldn't trigger here)
-    check_win_conditions()
-
     print(f"[IN_GAME] Started. Active player: {active_player}, Turn {turn_number}")
-
-# ── GAME_SETUP ────────────────────────────────────────────────────────────────
+    engine.begin_turn()
 
 def run_game_setup():
-    """Setup the game: shuffle, draw 7, determine first player."""
     global game_state, last_state_seq, active_player
-
     with lock:
         game_state = "GAME_SETUP"
 
@@ -245,12 +271,12 @@ def run_game_setup():
             "mulligan_count": 0,
             "battlefield": [],
             "graveyard": [],
+            "mana_pool": {},
         }
 
     with lock:
         game_state = "MULLIGAN"
 
-    # Send personalized GAME_STATE_UPDATE to each player
     seq = next_seq()
     for pid in pids:
         opp = get_opponent(pid)
@@ -259,7 +285,7 @@ def run_game_setup():
             "phase": "MULLIGAN",
             "active_player": active_player,
             "life_totals": {p: game_data[p]["life"] for p in pids},
-            "hand": game_data[pid]["hand"],
+            "hand": {pid: game_data[pid]["hand"]},
             "hand_counts": {opp: len(game_data[opp]["hand"])},
             "library_counts": {p: len(game_data[p]["library"]) for p in pids},
             "battlefield": {p: [] for p in pids},
@@ -269,55 +295,35 @@ def run_game_setup():
         last_state_seq[pid] = seq
         send_to(pid, game_state_update(state, seq))
 
-    print(f"[GAME_SETUP] Done. Active player: {active_player}. Now in MULLIGAN.")
-
-# ── MULLIGAN ──────────────────────────────────────────────────────────────────
-
 def handle_mulligan(conn, msg, pid):
-    """Handle MULLIGAN_CHOICE PDU."""
-    global game_state
-
     keep = msg.get("keep", True)
     to_bot = msg.get("cards_to_bottom", [])
     msg_seq = msg.get("seq_num", 0)
     pdata = game_data[pid]
     pids = get_pids()
 
-    # Validate seq_num
     expected_seq = last_state_seq.get(pid, 0)
     if msg_seq != expected_seq:
-        send_error(conn, "STALE_ACTION",
-            f"Priority token mismatch. Expected seq_num {expected_seq}, got {msg_seq}.",
-            msg, msg_seq)
+        send_error(conn, "STALE_ACTION", f"Priority token mismatch. Expected seq_num {expected_seq}, got {msg_seq}.", msg, msg_seq)
         return
 
-    # Prevent double-keep
     if mulligan_kept.get(pid, False):
-        send_error(conn, "ILLEGAL_ACTION",
-            f"Player {pid} has already kept their hand.", msg, msg_seq)
+        send_error(conn, "ILLEGAL_ACTION", f"Player {pid} has already kept their hand.", msg, msg_seq)
         return
 
     if keep:
-        # Validate cards_to_bottom count
         if len(to_bot) != pdata["mulligan_count"]:
-            send_error(conn, "ILLEGAL_ACTION",
-                f"cards_to_bottom must have exactly {pdata['mulligan_count']} card(s), "
-                f"got {len(to_bot)}.", msg, msg_seq)
+            send_error(conn, "ILLEGAL_ACTION", f"cards_to_bottom must have exactly {pdata['mulligan_count']} card(s), got {len(to_bot)}.", msg, msg_seq)
             return
 
-        # Validate every card is in hand
         for c in to_bot:
             if c not in pdata["hand"]:
-                send_error(conn, "ILLEGAL_ACTION",
-                    f"Card '{c}' is not in your hand.", msg, msg_seq)
+                send_error(conn, "ILLEGAL_ACTION", f"Card '{c}' is not in your hand.", msg, msg_seq)
                 return
 
-        # Move cards to bottom
         for c in to_bot:
             pdata["hand"].remove(c)
             pdata["library"].append(c)
-
-        print(f"[MULLIGAN] {pid} keeps (put {len(to_bot)} to bottom).")
 
         with mull_lock:
             mulligan_kept[pid] = True
@@ -325,18 +331,13 @@ def handle_mulligan(conn, msg, pid):
 
         if both_kept:
             start_in_game()
-
     else:
-        # Mulligan — reshuffle and redraw 7
         pdata["mulligan_count"] += 1
         pdata["library"] = pdata["hand"] + pdata["library"]
         random.shuffle(pdata["library"])
         pdata["hand"] = pdata["library"][:7]
         pdata["library"] = pdata["library"][7:]
 
-        print(f"[MULLIGAN] {pid} mulligans (#{pdata['mulligan_count']}).")
-
-        # Send new hand to this player only
         new_seq = next_seq()
         opp = get_opponent(pid)
         state = {
@@ -344,7 +345,7 @@ def handle_mulligan(conn, msg, pid):
             "phase": "MULLIGAN",
             "active_player": active_player,
             "life_totals": {p: game_data[p]["life"] for p in pids},
-            "hand": pdata["hand"],
+            "hand": {pid: pdata["hand"]},
             "hand_counts": {opp: len(game_data[opp]["hand"])},
             "library_counts": {p: len(game_data[p]["library"]) for p in pids},
             "battlefield": {p: [] for p in pids},
@@ -354,34 +355,17 @@ def handle_mulligan(conn, msg, pid):
         last_state_seq[pid] = new_seq
         send_to(pid, game_state_update(state, new_seq))
 
-# ── Handle CONCEDE ────────────────────────────────────────────────────────────
-
 def handle_concede(conn, msg, pid):
-    """Handle CONCEDE PDU."""
-    with lock:
-        cur_state = game_state
-
-    if cur_state != "IN_GAME":
-        send_error(conn, "WRONG_PHASE",
-            "CONCEDE only allowed during IN_GAME.", msg, msg.get("seq_num", 0))
+    if game_state != "IN_GAME":
+        send_error(conn, "WRONG_PHASE", "CONCEDE only allowed during IN_GAME.", msg, msg.get("seq_num", 0))
         return
-
     if game_over:
         return
-
-    pids = get_pids()
-    if pid not in pids:
-        return
-
     opp = get_opponent(pid)
     trigger_game_over("CONCEDE", opp, pid)
 
-# ── Client handler ────────────────────────────────────────────────────────────
-
 def handle_client(conn, addr):
-    """Handle a single client connection."""
     global game_state
-
     print(f"[CONNECTED] {addr}")
     local_pid = None
 
@@ -393,120 +377,129 @@ def handle_client(conn, addr):
 
             msg_type = msg.get("type")
             msg_seq = msg.get("seq_num", 0)
-            print(f"[RECV {addr}] {msg_type}")
 
-            # ── PING ──────────────────────────────────────────────────
             if msg_type == "PING":
                 send_pdu(conn, pong(msg["timestamp"], msg["seq_num"]))
 
-            # ── PLAYER_READY ─────────────────────────────────────────
             elif msg_type == "PLAYER_READY":
-                with lock:
-                    cur = game_state
-
-                if cur != "LOBBY":
-                    send_error(conn, "WRONG_PHASE",
-                        "PLAYER_READY is only accepted in LOBBY.", msg, msg_seq)
+                if game_state != "LOBBY":
+                    send_error(conn, "WRONG_PHASE", "PLAYER_READY is only accepted in LOBBY.", msg, msg_seq)
                     continue
 
                 pid = msg.get("player_id", "").strip()
                 deck_list = msg.get("deck_list", [])
 
                 if not pid:
-                    send_error(conn, "ILLEGAL_ACTION",
-                        "player_id must be a non-empty string.", msg, msg_seq)
+                    send_error(conn, "ILLEGAL_ACTION", "player_id must be a non-empty string.", msg, msg_seq)
                     continue
 
-                # Duplicate ID check
                 others = [p for p, c in players.items() if c != conn]
                 if pid in others:
-                    send_error(conn, "DUPLICATE_ID",
-                        f"'{pid}' is already taken by another player.", msg, msg_seq)
+                    send_error(conn, "DUPLICATE_ID", f"'{pid}' is already taken by another player.", msg, msg_seq)
                     continue
 
-                # Validate deck
                 ok, deck_err = validate_deck(deck_list)
                 if not ok:
                     send_error(conn, "ILLEGAL_DECK", deck_err, msg, msg_seq)
                     continue
 
-                # Register (or re-register) player
                 with lock:
                     players[pid] = conn
                     ready_data[pid] = {"deck": deck_list}
                     local_pid = pid
 
-                print(f"[LOBBY] {pid} ready ({len(ready_data)}/2).")
                 send_pdu(conn, lobby_update())
 
                 if len(ready_data) == 2:
                     threading.Thread(target=run_game_setup, daemon=True).start()
 
-            # ── MULLIGAN_CHOICE ──────────────────────────────────────
             elif msg_type == "MULLIGAN_CHOICE":
-                with lock:
-                    cur = game_state
-
-                if cur != "MULLIGAN":
-                    send_error(conn, "WRONG_PHASE",
-                        "MULLIGAN_CHOICE is only accepted during MULLIGAN.", msg, msg_seq)
+                if game_state != "MULLIGAN":
+                    send_error(conn, "WRONG_PHASE", "MULLIGAN_CHOICE is only accepted during MULLIGAN.", msg, msg_seq)
                     continue
-
-                if local_pid is None:
-                    send_error(conn, "ILLEGAL_ACTION",
-                        "Send PLAYER_READY first.", msg, msg_seq)
-                    continue
-
                 handle_mulligan(conn, msg, local_pid)
 
-            # ── CONCEDE ──────────────────────────────────────────────
             elif msg_type == "CONCEDE":
-                if local_pid is None:
-                    send_error(conn, "ILLEGAL_ACTION",
-                        "Send PLAYER_READY first.", msg, msg_seq)
-                    continue
-
                 handle_concede(conn, msg, local_pid)
 
-            # ── UNKNOWN ──────────────────────────────────────────────
+            elif msg_type == "PRIORITY_PASS":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "PRIORITY_PASS only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_priority_pass(conn, msg, local_pid)
+
+            elif msg_type == "CAST_SPELL":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "CAST_SPELL only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_cast_spell(conn, msg, local_pid)
+
+            elif msg_type == "ACTIVATE_ABILITY":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "ACTIVATE_ABILITY only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_activate_ability(conn, msg, local_pid)
+
+            elif msg_type == "PLAY_LAND":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "PLAY_LAND only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_play_land(conn, msg, local_pid)
+
+            elif msg_type == "DECLARE_ATTACKERS":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "DECLARE_ATTACKERS only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_declare_attackers(conn, msg, local_pid)
+
+            elif msg_type == "DECLARE_BLOCKERS":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "DECLARE_BLOCKERS only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_declare_blockers(conn, msg, local_pid)
+
+            elif msg_type == "ASSIGN_DAMAGE_ORDER":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "ASSIGN_DAMAGE_ORDER only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_assign_damage_order(conn, msg, local_pid)
+
+            elif msg_type == "DISCARD":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "DISCARD only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_discard(conn, msg, local_pid)
+
+            elif msg_type == "TRIGGER_CHOICE_RESPONSE":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "TRIGGER_CHOICE_RESPONSE only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_trigger_choice_response(conn, msg, local_pid)
+
+            elif msg_type == "TRIGGER_ORDER_RESPONSE":
+                if game_state != "IN_GAME" or engine is None:
+                    send_error(conn, "WRONG_PHASE", "TRIGGER_ORDER_RESPONSE only accepted during IN_GAME.", msg, msg_seq)
+                    continue
+                engine.handle_trigger_order_response(conn, msg, local_pid)
+
             else:
-                send_error(conn, "UNKNOWN_TYPE",
-                    f"Unknown PDU type: '{msg_type}'", msg, msg_seq)
+                send_error(conn, "UNKNOWN_TYPE", f"Unknown PDU type: '{msg_type}'", msg, msg_seq)
 
         except Exception as e:
             print(f"[ERROR] {addr}: {e}")
             break
 
-    # ── Cleanup on disconnect ────────────────────────────────────────
     print(f"[DISCONNECTED] {addr}")
     conn.close()
-
     if conn in clients:
         clients.remove(conn)
 
-    # If we were in a game and not already over, trigger GAME_OVER
-    with lock:
-        cur_state = game_state
-        is_over = game_over
-
-    if cur_state == "IN_GAME" and not is_over and local_pid:
+    if game_state == "IN_GAME" and not game_over and local_pid:
         pids = get_pids()
         if local_pid in pids:
             remaining = [p for p in pids if p != local_pid]
             if remaining:
                 trigger_game_over("DISCONNECT", remaining[0], local_pid)
-                return
-
-    # Otherwise, clean up the disconnected player from LOBBY/MULLIGAN
-    for p, c in list(players.items()):
-        if c == conn:
-            del players[p]
-            ready_data.pop(p, None)
-            mulligan_kept.pop(p, None)
-            last_state_seq.pop(p, None)
-            break
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -517,7 +510,6 @@ def main():
 
     while True:
         conn, addr = server.accept()
-
         if len(clients) >= 2:
             send_pdu(conn, {
                 "type": "ERROR", "seq_num": 0,
