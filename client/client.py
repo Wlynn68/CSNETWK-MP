@@ -1,9 +1,10 @@
 import json
 import os
 import socket
+import sys
 import threading
 
-from models.protocol import send_pdu, receive_pdu
+from models.protocol import send_pdu, receive_pdu, set_verbose, is_verbose
 from models.pdu import (
     player_ready, mulligan_choice, cast_spell, priotity_pass,
     play_land, activate_ability, trigger_choice_response,
@@ -292,9 +293,14 @@ def _print_battlefield():
 def main():
     global seq_num, mulligan_count, my_id
 
+    if "--verbose" in sys.argv or "-v" in sys.argv:
+        set_verbose(True)
+        print("[CLIENT] Verbose mode enabled via command-line flag")
+
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.connect((HOST, PORT))
     print(f"Connected to {HOST}:{PORT}")
+    print(f"[CLIENT] Verbose: {'ON' if is_verbose() else 'OFF'} (toggle: 'verbose on' / 'verbose off')")
 
     threading.Thread(target=receiver, args=(client,), daemon=True).start()
 
@@ -533,6 +539,18 @@ def main():
         elif action == "hand":
             print(f"  Hand: {hand}")
 
+        # ── VERBOSE toggle ──────────────────────────────────────────
+        elif action == "verbose":
+            if len(parts) >= 2 and parts[1].lower() == "on":
+                set_verbose(True)
+                print("[CLIENT] Verbose mode ON")
+            elif len(parts) >= 2 and parts[1].lower() == "off":
+                set_verbose(False)
+                print("[CLIENT] Verbose mode OFF")
+            else:
+                print(f"[CLIENT] Verbose mode is {'ON' if is_verbose() else 'OFF'}")
+                print("  Usage: verbose on | verbose off")
+
         # ── QUIT ────────────────────────────────────────────────────
         elif action == "quit":
             break
@@ -540,7 +558,7 @@ def main():
         else:
             print("Commands: keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
                   "land <card> | cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
-                  "block <blocker> <attacker>... | order <attacker> <blocker>... | bf | hand | concede | quit")
+                  "block <blocker> <attacker>... | order <attacker> <blocker>... | bf | hand | verbose | concede | quit")
             _print_command_examples()
 
     client.close()

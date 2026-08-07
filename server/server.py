@@ -1,8 +1,9 @@
 import socket
+import sys
 import threading
 import random
 
-from models.protocol import receive_pdu, send_pdu
+from models.protocol import receive_pdu, send_pdu, set_verbose, is_verbose
 from models.pdu import game_state_update, error, pong
 from models.cards import all_legal_card_ids, get_card, is_creature
 from server.priority_stack import PriorityStackEngine
@@ -504,12 +505,41 @@ def handle_client(conn, addr):
             if remaining:
                 trigger_game_over("DISCONNECT", remaining[0], local_pid)
 
+def _server_console():
+    """Background thread that reads server operator commands (e.g. toggle verbose)."""
+    while True:
+        try:
+            cmd = input()
+        except EOFError:
+            break
+        cmd = cmd.strip().lower()
+        if cmd == "verbose on":
+            set_verbose(True)
+            print("[SERVER] Verbose mode ON")
+        elif cmd == "verbose off":
+            set_verbose(False)
+            print("[SERVER] Verbose mode OFF")
+        elif cmd == "verbose":
+            print(f"[SERVER] Verbose mode is {'ON' if is_verbose() else 'OFF'}")
+        elif cmd == "help":
+            print("[SERVER] Commands: verbose on | verbose off | verbose | help")
+        else:
+            print("[SERVER] Unknown command. Type 'help' for options.")
+
+
 def main():
+    if "--verbose" in sys.argv or "-v" in sys.argv:
+        set_verbose(True)
+        print("[SERVER] Verbose mode enabled via command-line flag")
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(2)
     print(f"[SERVER] Listening on {HOST}:{PORT}")
+    print(f"[SERVER] Verbose: {'ON' if is_verbose() else 'OFF'} (toggle at runtime: 'verbose on' / 'verbose off')")
+
+    threading.Thread(target=_server_console, daemon=True).start()
 
     while True:
         conn, addr = server.accept()
