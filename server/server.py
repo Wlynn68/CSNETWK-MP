@@ -92,16 +92,18 @@ def _format_battlefield_for_state(pid: str) -> list[dict]:
         card = get_card(perm["card_id"])
         item = {
             "id": perm.get("id", perm.get("instance_id")),
+            "instance_id": perm.get("instance_id", perm.get("id")),
+            "card_id": perm["card_id"],
             "tapped": perm.get("tapped", False),
+            "damage": perm.get("damage", 0),
+            "summoning_sick": perm.get("summoning_sick", True),
         }
         if is_creature(perm["card_id"]):
             base_p = card.get("power") or 0
             base_t = card.get("toughness") or 0
             item.update({
-                "damage": perm.get("damage", 0),
                 "power": base_p + perm.get("pump_power", 0),
                 "toughness": base_t + perm.get("pump_toughness", 0),
-                "summoning_sick": perm.get("summoning_sick", True),
             })
         formatted.append(item)
     return formatted
@@ -118,6 +120,7 @@ def broadcast_game_state():
             "turn": turn_number,
             "active_player": active_player,
             "phase": current_phase or "UNTAP",
+            "priority_player": engine.priority_player if (engine and current_phase not in ("UNTAP", "CLEANUP")) else None,
             "priority_holder": engine.priority_player if (engine and current_phase not in ("UNTAP", "CLEANUP")) else None,
             "life_totals": {p: game_data[p]["life"] for p in pids},
             "stack": engine.stack if engine else [],
