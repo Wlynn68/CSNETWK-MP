@@ -343,21 +343,23 @@ for _burn in ("rift_bolt", "shock", "lightning_bolt", "searing_spear", "incinera
 def get_registry(base: str) -> dict:
     return CARD_REGISTRY.get(base, {})
 
+
+def _card_base_id(card_id: str) -> str:
+    """Strip trailing _NNN instance suffix to get the base card name."""
+    return re.sub(r"_\d+$", "", card_id)
+
+
 def spell_effect_for(card_id: str) -> dict | None:
-    from models.cards import card_base_id
-    return CARD_REGISTRY.get(card_base_id(card_id), {}).get("spell")
+    return CARD_REGISTRY.get(_card_base_id(card_id), {}).get("spell")
 
 def abilities_for(card_id: str) -> list[dict]:
-    from models.cards import card_base_id
-    return CARD_REGISTRY.get(card_base_id(card_id), {}).get("abilities", [])
+    return CARD_REGISTRY.get(_card_base_id(card_id), {}).get("abilities", [])
 
 def keywords_for(card_id: str) -> list[str]:
-    from models.cards import card_base_id
-    return CARD_REGISTRY.get(card_base_id(card_id), {}).get("keywords", [])
+    return CARD_REGISTRY.get(_card_base_id(card_id), {}).get("keywords", [])
 
 def etb_for(card_id: str) -> dict | None:
-    from models.cards import card_base_id
-    return CARD_REGISTRY.get(card_base_id(card_id), {}).get("etb")
+    return CARD_REGISTRY.get(_card_base_id(card_id), {}).get("etb")
 
 def targets_required(spell: dict | None) -> int:
     if not spell:

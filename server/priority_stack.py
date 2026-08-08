@@ -3,6 +3,7 @@
 
 
 import random
+import threading
 from models.card_effects import (
     ability_targets_required,
     etb_for,
@@ -82,9 +83,39 @@ class PriorityStackEngine:
         self.priority_seq = self.ctx.next_seq()
         self.ctx.send_to(player_id, priority_grant(player_id, self.priority_seq, PRIORITY_TIME_MS))
         print(f"[PRIORITY] Granted to {player_id} (seq={self.priority_seq})")
+        self._start_priority_timer(player_id)
+
+    def _start_priority_timer(self, player_id: str):
+        if hasattr(self, '_priority_timer') and self._priority_timer is not None:
+            self._priority_timer.cancel()
+        seq_at_grant = self.priority_seq
+        self._priority_timer = threading.Timer(
+            PRIORITY_TIME_MS / 1000.0,
+            self._on_priority_timeout,
+            args=(player_id, seq_at_grant),
+        )
+        self._priority_timer.daemon = True
+        self._priority_timer.start()
+
+    def _cancel_priority_timer(self):
+        if hasattr(self, '_priority_timer') and self._priority_timer is not None:
+            self._priority_timer.cancel()
+            self._priority_timer = None
+
+    def _on_priority_timeout(self, player_id: str, seq_at_grant: int):
+        if self.ctx.game_over:
+            return
+        if self.priority_seq != seq_at_grant:
+            return
+        if self.priority_player != player_id:
+            return
+        print(f"[TIMEOUT] {player_id} failed to respond within {PRIORITY_TIME_MS}ms.")
+        opp = self.ctx.get_opponent(player_id)
+        self.ctx.trigger_game_over("DISCONNECT", opp, player_id)
 
     def validate_priority_action(self, conn, msg, pid) -> bool:
         msg_seq = msg.get("seq_num", 0)
+        self._cancel_priority_timer()
         if self.pending_choice:
             self.ctx.send_error(conn, "WRONG_PHASE",
                 "Waiting for trigger/choice/combat decision response.", msg, msg_seq)
@@ -251,8 +282,14 @@ class PriorityStackEngine:
         self._empty_mana_pools()
         active = self.ctx.active_player
         self.untap_all(active)
-        self._clear_until_eot_effects()
+        self._clear_summoning_sickness(active)
+        self.ctx.broadcast_game_state()
         self._broadcast_phase("UNTAP", "UPKEEP")
+        self.passes_since_action = 0
+        self.grant_priority(active)
+
+    def _advance_from_upkeep(self):
+        active = self.ctx.active_player
         self._broadcast_phase("UPKEEP", "DRAW")
         if self.ctx.turn_number > 1:
             pdata = self.ctx.game_data[active]
@@ -260,11 +297,22 @@ class PriorityStackEngine:
                 self.ctx.trigger_game_over("DECK_EMPTY", self.ctx.get_opponent(active), active)
                 return
             pdata["hand"].append(pdata["library"].pop(0))
+        self.ctx.broadcast_game_state()
+        self.passes_since_action = 0
+        self.grant_priority(active)
+
+    def _advance_from_draw(self):
+        active = self.ctx.active_player
         self._broadcast_phase("DRAW", "PRECOMBAT_MAIN")
         self.ctx.current_phase = "PRECOMBAT_MAIN"
         self.passes_since_action = 0
         self.ctx.broadcast_game_state()
         self.grant_priority(active)
+
+    def _clear_summoning_sickness(self, pid: str):
+        """Clear summoning sickness for all permanents controlled by pid at their Untap Step."""
+        for perm in self.ctx.game_data[pid].get("battlefield", []):
+            perm["summoning_sick"] = False
 
     def _clear_until_eot_effects(self):
         for pdata in self.ctx.game_data.values():
@@ -277,7 +325,13 @@ class PriorityStackEngine:
 
     def advance_after_both_pass(self):
         phase = self.ctx.current_phase
-        if phase == "PRECOMBAT_MAIN":
+        if phase == "UPKEEP":
+            self._advance_from_upkeep()
+
+        elif phase == "DRAW":
+            self._advance_from_draw()
+
+        elif phase == "PRECOMBAT_MAIN":
             self._broadcast_phase("PRECOMBAT_MAIN", "BEGIN_COMBAT")
             self.passes_since_action = 0
             self.grant_priority(self.ctx.active_player)
@@ -379,9 +433,18 @@ class PriorityStackEngine:
             if found.get("tapped"):
                 self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Creature '{cid}' is tapped.", msg, msg_seq)
                 return
-            if found.get("summoning_sick") and "haste" not in found.get("keywords", keywords_for(found["card_id"])):
+            kw = found.get("keywords", keywords_for(found["card_id"]))
+            if "defender" in kw:
+                self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Creature '{cid}' has Defender and cannot attack.", msg, msg_seq)
+                return
+            if found.get("summoning_sick") and "haste" not in kw:
                 self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Creature '{cid}' has summoning sickness.", msg, msg_seq)
                 return
+            if found.get("auras"):
+                for aura in found.get("auras", []):
+                    if aura.get("effect") == "pacifism":
+                        self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Creature '{cid}' is enchanted by Pacifism and cannot attack.", msg, msg_seq)
+                        return
 
         # Tap declared attackers
         for att in attackers:
@@ -429,6 +492,14 @@ class PriorityStackEngine:
             if not is_creature(found["card_id"]):
                 self.ctx.send_error(conn, "ILLEGAL_ACTION", f"'{cid}' is not a creature.", msg, msg_seq)
                 return
+            if found.get("tapped"):
+                self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Blocker '{cid}' is tapped and cannot block.", msg, msg_seq)
+                return
+            if found.get("auras"):
+                for aura in found.get("auras", []):
+                    if aura.get("effect") == "pacifism":
+                        self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Creature '{cid}' is enchanted by Pacifism and cannot block.", msg, msg_seq)
+                        return
             if target_att not in valid_att_ids:
                 self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Target attacker '{target_att}' invalid.", msg, msg_seq)
                 return
