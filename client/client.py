@@ -9,7 +9,9 @@ from models.pdu import (
     player_ready, mulligan_choice, cast_spell, priotity_pass,
     play_land, activate_ability, trigger_choice_response,
     declare_attackers, declare_blockers, assign_damage_order,
+    discard as discard_pdu, ping,
 )
+import time
 from models.cards import get_card, card_base_id, is_land
 from models.card_effects import abilities_for
 
@@ -31,6 +33,9 @@ active_player = None
 opponent_id = None
 pending_choice_seq = 0
 pending_choice_id = None
+last_phase_seq = 0       # seq_num of most recent PHASE_TRANSITION (echoed by combat PDUs)
+last_state_seq = 0       # seq_num of most recent GAME_STATE_UPDATE (echoed by DISCARD)
+last_recv_seq = 0        # seq_num of most recently received PDU of any type (echoed by CONCEDE)
 lock = threading.Lock()
 
 
@@ -142,12 +147,42 @@ def _resolve_card_id(token: str, hand_cards: list[str]) -> str | None:
             return card_id
     return None
 
+last_pong_time = None
+last_ping_sent_time = None
+
+# ── Heartbeat thread ────────────────────────────────────────────────────────────
+
+def heartbeat(sock):
+    """RFC 4.3: send PING every 30s; if no PONG within 10s, disconnect."""
+    global seq_num, last_pong_time, last_ping_sent_time
+    last_pong_time = time.time()
+    while True:
+        time.sleep(30)
+        try:
+            with lock:
+                s = seq_num
+                seq_num += 1
+            last_ping_sent_time = time.time()
+            send_pdu(sock, ping(int(time.time() * 1000), s))
+        except Exception:
+            break
+        time.sleep(10)
+        if last_pong_time is not None and last_ping_sent_time is not None \
+                and last_pong_time < last_ping_sent_time:
+            print("\n[CLIENT] No PONG received within timeout; closing connection.")
+            try:
+                sock.close()
+            except Exception:
+                pass
+            break
+
 # ── Receiver thread ───────────────────────────────────────────────────────────
 
 def receiver(sock):
     global last_hand_seq, my_hand, priority_seq, has_priority, priority_holder
     global my_battlefield, game_stack, current_phase, active_player, opponent_id
     global pending_choice_seq, pending_choice_id
+    global last_phase_seq, last_state_seq, last_recv_seq
 
     while True:
         msg = receive_pdu(sock)
@@ -157,6 +192,9 @@ def receiver(sock):
 
         msg_type = msg.get("type")
         seq = msg.get("seq_num", 0)
+
+        with lock:
+            last_recv_seq = seq
 
         if msg_type == "GAME_STATE_UPDATE" and msg.get("state", {}).get("phase") == "MULLIGAN":
             with lock:
@@ -169,6 +207,7 @@ def receiver(sock):
             state = msg.get("state", {})
             phase = state.get("phase")
             with lock:
+                last_state_seq = seq
                 current_phase = phase
                 active_player = state.get("active_player")
                 my_hand = _extract_my_hand(state, my_id)
@@ -207,7 +246,11 @@ def receiver(sock):
                 _print_hand_summary(my_hand)
                 _print_battlefield_summary(state)
                 print()
-                print("  Commands: pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target] | concede")
+                if phase == "CLEANUP" and active_player == my_id and len(my_hand) > 7:
+                    print(f"  Cleanup: your hand has {len(my_hand)} cards, max is 7.")
+                    print(f"  → discard <card1> <card2> ... (must discard {len(my_hand) - 7} card(s))")
+                else:
+                    print("  Commands: pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target] | concede")
 
         elif msg_type == "PRIORITY_GRANT":
             grantee = msg.get("player_id")
@@ -246,8 +289,16 @@ def receiver(sock):
             print("  → yes (accept/pay) | no (decline)")
 
         elif msg_type == "PHASE_TRANSITION":
+            with lock:
+                last_phase_seq = seq
             print(f"  {msg.get('from_phase')} → {msg.get('to_phase')}")
             print(f"  Active player: {msg.get('active_player')}  Turn: {msg.get('turn')}")
+            if msg.get("to_phase") == "DECLARE_ATTACKERS" and msg.get("active_player") == my_id:
+                print("  → attack <creature_id> [creature_id ...]  (or 'attack' with none to skip)")
+            elif msg.get("to_phase") == "DECLARE_BLOCKERS" and msg.get("active_player") != my_id:
+                print("  → block <blocker_id> <attacker_id> [...]  (or 'block' with none to skip)")
+            elif msg.get("to_phase") == "ASSIGN_DAMAGE_ORDER" and msg.get("active_player") == my_id:
+                print("  → order <attacker_id> <blocker_id> [blocker_id ...]")
 
         elif msg_type == "GAME_OVER":
             print(f"  GAME OVER!")
@@ -259,6 +310,10 @@ def receiver(sock):
 
         elif msg_type == "ERROR":
             print(f"  [!] {msg.get('code')}: {msg.get('message')}")
+
+        elif msg_type == "PONG":
+            global last_pong_time
+            last_pong_time = time.time()
 
         else:
             print(f"  {msg}")
@@ -303,6 +358,7 @@ def main():
     print(f"[CLIENT] Verbose: {'ON' if is_verbose() else 'OFF'} (toggle: 'verbose on' / 'verbose off')")
 
     threading.Thread(target=receiver, args=(client,), daemon=True).start()
+    threading.Thread(target=heartbeat, args=(client,), daemon=True).start()
 
     my_id = input("Player ID: ").strip()
 
@@ -374,6 +430,11 @@ def main():
             pseq = priority_seq
             bf = list(my_battlefield)
             opp = opponent_id
+            phseq = last_phase_seq
+            stseq = last_state_seq
+            rseq = last_recv_seq
+            choice_seq = pending_choice_seq
+            choice_id = pending_choice_id
 
         # ── MULLIGAN commands ──────────────────────────────────────
         if action == "keep" and len(parts) == 1:
@@ -492,25 +553,20 @@ def main():
 
         # ── DECLARE_ATTACKERS ─────────────────────────────────────────
         elif action == "attack":
-            if len(parts) < 2:
-                print("  Usage: attack <creature_id> [creature_id ...]")
-                continue
-            attackers = [{"creature_id": cid} for cid in parts[1:]]
-            send_pdu(client, declare_attackers(attackers, seq_num))
-            seq_num += 1
-            print(f"[SENT] DECLARE_ATTACKERS attackers={parts[1:]}")
+            attackers = [{"creature_id": cid, "target": opp} for cid in parts[1:]]
+            send_pdu(client, declare_attackers(attackers, phseq))
+            print(f"[SENT] DECLARE_ATTACKERS attackers={parts[1:]} seq={phseq}")
 
         # ── DECLARE_BLOCKERS ─────────────────────────────────────────
         elif action == "block":
-            if len(parts) < 3 or len(parts[1:]) % 2 != 0:
-                print("  Usage: block <blocker_id> <attacker_id> [<blocker_id> <attacker_id> ...]")
+            if len(parts) > 1 and (len(parts) < 3 or len(parts[1:]) % 2 != 0):
+                print("  Usage: block <blocker_id> <attacker_id> [<blocker_id> <attacker_id> ...]  (no args = no blocks)")
                 continue
             blockers = []
             for i in range(1, len(parts), 2):
                 blockers.append({"creature_id": parts[i], "blocking_id": parts[i+1]})
-            send_pdu(client, declare_blockers(blockers, seq_num))
-            seq_num += 1
-            print(f"[SENT] DECLARE_BLOCKERS blockers={blockers}")
+            send_pdu(client, declare_blockers(blockers, phseq))
+            print(f"[SENT] DECLARE_BLOCKERS blockers={blockers} seq={phseq}")
 
         # ── ASSIGN_DAMAGE_ORDER ────────────────────────────────────────
         elif action == "order":
@@ -519,19 +575,34 @@ def main():
                 continue
             attacker_id = parts[1]
             blocker_order = parts[2:]
-            send_pdu(client, assign_damage_order(attacker_id, blocker_order, seq_num))
-            seq_num += 1
-            print(f"[SENT] ASSIGN_DAMAGE_ORDER attacker={attacker_id} order={blocker_order}")
+            send_pdu(client, assign_damage_order(attacker_id, blocker_order, phseq))
+            print(f"[SENT] ASSIGN_DAMAGE_ORDER attacker={attacker_id} order={blocker_order} seq={phseq}")
 
         # ── CONCEDE ─────────────────────────────────────────────────
         elif action == "concede":
             send_pdu(client, {
                 "type": "CONCEDE",
-                "seq_num": seq_num,
+                "seq_num": rseq,
                 "player_id": my_id,
             })
-            seq_num += 1
-            print("[SENT] CONCEDE")
+            print(f"[SENT] CONCEDE seq={rseq}")
+
+        # ── DISCARD (Cleanup, hand > 7) ────────────────────────────────
+        elif action == "discard":
+            cards = parts[1:]
+            if not cards:
+                print("  Usage: discard <card1> <card2> ...")
+                continue
+            send_pdu(client, discard_pdu(cards, stseq))
+            print(f"[SENT] DISCARD card_ids={cards} seq={stseq}")
+
+        # ── TRIGGER_CHOICE_RESPONSE (accept/decline a 'may' choice) ────
+        elif action in ("yes", "no"):
+            if choice_id is None:
+                print("  No pending trigger choice.")
+                continue
+            send_pdu(client, trigger_choice_response(choice_id, action == "yes", None, choice_seq))
+            print(f"[SENT] TRIGGER_CHOICE_RESPONSE trigger_id={choice_id} accept={action == 'yes'}")
 
         elif action == "bf" or action == "battlefield":
             _print_battlefield()
@@ -551,14 +622,14 @@ def main():
                 print(f"[CLIENT] Verbose mode is {'ON' if is_verbose() else 'OFF'}")
                 print("  Usage: verbose on | verbose off")
 
-        # ── QUIT ────────────────────────────────────────────────────
         elif action == "quit":
             break
 
         else:
             print("Commands: keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
                   "land <card> | cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
-                  "block <blocker> <attacker>... | order <attacker> <blocker>... | bf | hand | verbose | concede | quit")
+                  "block <blocker> <attacker>... | order <attacker> <blocker>... | discard <cards...> | "
+                  "yes | no | bf | hand | verbose | concede | quit")
             _print_command_examples()
 
     client.close()

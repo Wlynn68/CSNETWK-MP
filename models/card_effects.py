@@ -273,57 +273,63 @@ for _base, _card in CARD_CATALOG.items():
         "is_artifact_creature": _card.get("card_type") == "Artifact Creature",
     }
 
-# Fix sol ring / basic lands if parser missed
-if not CARD_REGISTRY["sol_ring"]["abilities"]:
+# Fix sol ring / basic lands if parser missed.
+# NOTE: these patches are guarded with "in CARD_REGISTRY" checks so that a
+# card_catalog.json which doesn't happen to define one of these exact card
+# names doesn't crash the whole server at import time with a KeyError.
+if "sol_ring" in CARD_REGISTRY and not CARD_REGISTRY["sol_ring"]["abilities"]:
     CARD_REGISTRY["sol_ring"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "add_mana", "color": "C", "amount": 2}
     ]
 
 for _land, _color in [("mountain", "R"), ("forest", "G"), ("island", "U"), ("plains", "W"), ("swamp", "B")]:
-    CARD_REGISTRY[_land]["abilities"] = [
-        {"tap": True, "mana": {}, "effect": "add_mana", "color": _color, "amount": 1}
-    ]
+    if _land in CARD_REGISTRY:
+        CARD_REGISTRY[_land]["abilities"] = [
+            {"tap": True, "mana": {}, "effect": "add_mana", "color": _color, "amount": 1}
+        ]
 
 # Ensure prodigal sorcerer / merfolk / mother / royal / millstone / rod parsed
-if not CARD_REGISTRY["prodigal_sorcerer"]["abilities"]:
+if "prodigal_sorcerer" in CARD_REGISTRY and not CARD_REGISTRY["prodigal_sorcerer"]["abilities"]:
     CARD_REGISTRY["prodigal_sorcerer"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "damage", "amount": 1, "target": "any"}
     ]
-if not CARD_REGISTRY["merfolk_looter"]["abilities"]:
+if "merfolk_looter" in CARD_REGISTRY and not CARD_REGISTRY["merfolk_looter"]["abilities"]:
     CARD_REGISTRY["merfolk_looter"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "loot"}
     ]
-if not CARD_REGISTRY["mother_of_runes"]["abilities"]:
+if "mother_of_runes" in CARD_REGISTRY and not CARD_REGISTRY["mother_of_runes"]["abilities"]:
     CARD_REGISTRY["mother_of_runes"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "protection", "target": "friendly_creature"}
     ]
-if not CARD_REGISTRY["royal_assassin"]["abilities"]:
+if "royal_assassin" in CARD_REGISTRY and not CARD_REGISTRY["royal_assassin"]["abilities"]:
     CARD_REGISTRY["royal_assassin"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "destroy_creature", "filter": "tapped"}
     ]
-if not CARD_REGISTRY["millstone"]["abilities"]:
+if "millstone" in CARD_REGISTRY and not CARD_REGISTRY["millstone"]["abilities"]:
     CARD_REGISTRY["millstone"]["abilities"] = [
         {"tap": True, "mana": {"X": 2}, "effect": "mill", "amount": 2, "target": "player"}
     ]
-if not CARD_REGISTRY["rod_of_ruin"]["abilities"]:
+if "rod_of_ruin" in CARD_REGISTRY and not CARD_REGISTRY["rod_of_ruin"]["abilities"]:
     CARD_REGISTRY["rod_of_ruin"]["abilities"] = [
         {"tap": True, "mana": {"X": 3}, "effect": "damage", "amount": 1, "target": "any"}
     ]
-if not CARD_REGISTRY["llanowar_elves"]["abilities"]:
+if "llanowar_elves" in CARD_REGISTRY and not CARD_REGISTRY["llanowar_elves"]["abilities"]:
     CARD_REGISTRY["llanowar_elves"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "add_mana", "color": "G", "amount": 1}
     ]
-if not CARD_REGISTRY["elvish_mystic"]["abilities"]:
+if "elvish_mystic" in CARD_REGISTRY and not CARD_REGISTRY["elvish_mystic"]["abilities"]:
     CARD_REGISTRY["elvish_mystic"]["abilities"] = [
         {"tap": True, "mana": {}, "effect": "add_mana", "color": "G", "amount": 1}
     ]
-if not CARD_REGISTRY["troll_ascetic"]["abilities"]:
+if "troll_ascetic" in CARD_REGISTRY and not CARD_REGISTRY["troll_ascetic"]["abilities"]:
     CARD_REGISTRY["troll_ascetic"]["abilities"] = [
         {"tap": False, "mana": {"G": 1, "X": 1}, "effect": "regenerate_self"}
     ]
 
 # Rift bolt same as bolt for resolution (suspend ignored in simplified rules)
 for _burn in ("rift_bolt", "shock", "lightning_bolt", "searing_spear", "incinerate", "skullcrack"):
+    if _burn not in CARD_REGISTRY:
+        continue
     if CARD_REGISTRY[_burn]["spell"] is None and _damage_amount(CARD_CATALOG[_burn]["simplified_effect"]):
         d = _damage_amount(CARD_CATALOG[_burn]["simplified_effect"])
         t = "any"

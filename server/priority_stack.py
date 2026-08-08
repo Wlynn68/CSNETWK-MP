@@ -1,7 +1,6 @@
-"""
-Priority, stack, combat sub-state machine, and spell/ability resolution engine.
-Fully aligned with RFC 0001 MTGNP v1.0 Specification.
-"""
+
+#Priority, stack, combat sub-state machine, and spell/ability resolution engine.
+
 
 import random
 from models.card_effects import (
@@ -100,6 +99,12 @@ class PriorityStackEngine:
                 msg, msg_seq)
             return False
         return True
+
+    def _reissue_priority(self):
+        """RFC 0001 s11: if the player still holds priority after a rejected
+        action, re-issue PRIORITY_GRANT (same holder) so they can retry."""
+        if self.priority_player and not self.ctx.game_over:
+            self.grant_priority(self.priority_player)
 
     def handle_priority_pass(self, conn, msg, pid):
         if not self.validate_priority_action(conn, msg, pid):
@@ -353,6 +358,10 @@ class PriorityStackEngine:
         if self.ctx.current_phase != "DECLARE_ATTACKERS":
             self.ctx.send_error(conn, "WRONG_PHASE", "Not in DECLARE_ATTACKERS step.", msg, msg_seq)
             return
+        if msg_seq != self.last_phase_seq:
+            self.ctx.send_error(conn, "STALE_ACTION",
+                f"Priority token mismatch. Expected seq_num {self.last_phase_seq}, got {msg_seq}.", msg, msg_seq)
+            return
 
         attackers = msg.get("attackers", [])
         bf = self.ctx.game_data[pid]["battlefield"]
@@ -401,6 +410,10 @@ class PriorityStackEngine:
         if self.ctx.current_phase != "DECLARE_BLOCKERS":
             self.ctx.send_error(conn, "WRONG_PHASE", "Not in DECLARE_BLOCKERS step.", msg, msg_seq)
             return
+        if msg_seq != self.last_phase_seq:
+            self.ctx.send_error(conn, "STALE_ACTION",
+                f"Priority token mismatch. Expected seq_num {self.last_phase_seq}, got {msg_seq}.", msg, msg_seq)
+            return
 
         blockers = msg.get("blockers", [])
         bf = self.ctx.game_data[pid]["battlefield"]
@@ -432,6 +445,10 @@ class PriorityStackEngine:
             return
         if self.ctx.current_phase != "ASSIGN_DAMAGE_ORDER":
             self.ctx.send_error(conn, "WRONG_PHASE", "Not in ASSIGN_DAMAGE_ORDER step.", msg, msg_seq)
+            return
+        if msg_seq != self.last_phase_seq:
+            self.ctx.send_error(conn, "STALE_ACTION",
+                f"Priority token mismatch. Expected seq_num {self.last_phase_seq}, got {msg_seq}.", msg, msg_seq)
             return
 
         att_id = msg.get("attacker_id")
@@ -577,6 +594,11 @@ class PriorityStackEngine:
         if self.ctx.current_phase != "CLEANUP":
             self.ctx.send_error(conn, "WRONG_PHASE", "DISCARD only allowed during CLEANUP.", msg, msg_seq)
             return
+        expected_seq = self.ctx.last_seq_sent.get(pid)
+        if msg_seq != expected_seq:
+            self.ctx.send_error(conn, "STALE_ACTION",
+                f"Priority token mismatch. Expected seq_num {expected_seq}, got {msg_seq}.", msg, msg_seq)
+            return
 
         to_discard = msg.get("card_ids", [])
         hand = self.ctx.game_data[pid]["hand"]
@@ -617,21 +639,27 @@ class PriorityStackEngine:
 
         if msg_seq != self.priority_seq:
             self.ctx.send_error(conn, "STALE_ACTION", f"Priority token mismatch. Expected seq_num {self.priority_seq}, got {msg_seq}.", msg, msg_seq)
+            self._reissue_priority()
             return
         if pid != self.ctx.active_player:
             self.ctx.send_error(conn, "ILLEGAL_ACTION", "Only active player may play a land.", msg, msg_seq)
+            self._reissue_priority()
             return
         if self.ctx.current_phase not in MAIN_PHASES:
             self.ctx.send_error(conn, "WRONG_PHASE", "Lands only in main phases.", msg, msg_seq)
+            self._reissue_priority()
             return
         if pid in self.land_played_this_turn:
             self.ctx.send_error(conn, "ILLEGAL_ACTION", "Already played a land this turn.", msg, msg_seq)
+            self._reissue_priority()
             return
         if card_id not in self.ctx.game_data[pid]["hand"]:
             self.ctx.send_error(conn, "ILLEGAL_ACTION", f"'{card_id}' not in hand.", msg, msg_seq)
+            self._reissue_priority()
             return
         if not is_land(card_id):
             self.ctx.send_error(conn, "ILLEGAL_ACTION", f"'{card_id}' is not a land.", msg, msg_seq)
+            self._reissue_priority()
             return
 
         self.ctx.game_data[pid]["hand"].remove(card_id)
