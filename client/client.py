@@ -4,7 +4,7 @@ import socket
 import sys
 import threading
 
-from models.protocol import send_pdu, receive_pdu, set_verbose, is_verbose
+from models.protocol import send_pdu, receive_pdu, set_verbose, is_verbose, InvalidPDUError, PDUTooLargeError
 from models.pdu import (
     player_ready, mulligan_choice, cast_spell, priotity_pass,
     play_land, activate_ability, trigger_choice_response,
@@ -25,6 +25,7 @@ has_priority = False
 priority_holder = None
 my_hand = []
 my_battlefield = []
+graveyards = {}
 game_stack = []
 mulligan_count = 0
 my_id = None
@@ -98,6 +99,21 @@ def _print_battlefield_summary(state: dict | None = None):
         print(f"    {label}: {', '.join(summary_items) if summary_items else '(empty)'}")
 
 
+def _print_graveyard_summary(state: dict | None = None):
+    if state is None:
+        state = {}
+    graveyard_map = state.get("graveyard", {})
+    if not isinstance(graveyard_map, dict) or not graveyard_map:
+        print("  Graveyard summary: (empty)")
+        return
+
+    print("  Graveyard summary:")
+    for pid, cards in graveyard_map.items():
+        label = "You" if pid == my_id else pid
+        names = [_card_display_name(c) for c in cards]
+        print(f"    {label}: {', '.join(names) if names else '(empty)'}")
+
+
 def _print_command_examples():
     print("Examples:")
     print("  play mountain_001")
@@ -128,6 +144,8 @@ def _print_turn_status(state: dict | None = None):
     else:
         print("  Priority: waiting for next grant")
     _print_battlefield_summary(state or {"battlefield": {my_id: my_battlefield} if my_id else {}})
+    gy_state = state if isinstance(state, dict) and "graveyard" in state else {"graveyard": graveyards}
+    _print_graveyard_summary(gy_state)
 
 
 def _resolve_card_id(token: str, hand_cards: list[str]) -> str | None:
@@ -150,26 +168,47 @@ def _resolve_card_id(token: str, hand_cards: list[str]) -> str | None:
 last_pong_time = None
 last_ping_sent_time = None
 
+# Set once the connection is known to be gone (server closed it, a socket
+# error occurred, or our own heartbeat gave up waiting for a PONG). The
+# main input loop polls this so it can stop prompting for commands and
+# exit cleanly instead of crashing on the next send over a dead socket.
+disconnected_event = threading.Event()
+disconnect_reason = {"text": None}
+
+
+def _mark_disconnected(reason: str):
+    """Idempotently record why we disconnected. First reason wins so a
+    cascade of follow-on socket errors doesn't overwrite the real cause."""
+    if not disconnected_event.is_set():
+        disconnect_reason["text"] = reason
+        disconnected_event.set()
+
 # ── Heartbeat thread ────────────────────────────────────────────────────────────
 
 def heartbeat(sock):
     """RFC 4.3: send PING every 30s; if no PONG within 10s, disconnect."""
     global seq_num, last_pong_time, last_ping_sent_time
     last_pong_time = time.time()
-    while True:
+    while not disconnected_event.is_set():
         time.sleep(30)
+        if disconnected_event.is_set():
+            break
         try:
             with lock:
                 s = seq_num
                 seq_num += 1
             last_ping_sent_time = time.time()
             send_pdu(sock, ping(int(time.time() * 1000), s))
-        except Exception:
+        except OSError as e:
+            _mark_disconnected(f"Could not send PING: {e}")
             break
         time.sleep(10)
+        if disconnected_event.is_set():
+            break
         if last_pong_time is not None and last_ping_sent_time is not None \
                 and last_pong_time < last_ping_sent_time:
             print("\n[CLIENT] No PONG received within timeout; closing connection.")
+            _mark_disconnected("No PONG received within the 10s heartbeat timeout.")
             try:
                 sock.close()
             except Exception:
@@ -180,14 +219,32 @@ def heartbeat(sock):
 
 def receiver(sock):
     global last_hand_seq, my_hand, priority_seq, has_priority, priority_holder
-    global my_battlefield, game_stack, current_phase, active_player, opponent_id
+    global my_battlefield, graveyards, game_stack, current_phase, active_player, opponent_id
     global pending_choice_seq, pending_choice_id
-    global last_phase_seq, last_state_seq, last_recv_seq
+    global last_phase_seq, last_state_seq, last_recv_seq, last_pong_time
 
     while True:
-        msg = receive_pdu(sock)
+        try:
+            msg = receive_pdu(sock)
+        except PDUTooLargeError as e:
+            # The server would never legitimately send an oversized frame;
+            # treat it as a fatal framing problem, same as a dropped socket.
+            print(f"\n[CLIENT] Server sent an oversized/malformed frame: {e}")
+            _mark_disconnected(f"Oversized frame from server: {e}")
+            break
+        except InvalidPDUError as e:
+            # Well-framed but unparseable bytes. Framing stays in sync, so
+            # this is recoverable — log it and keep listening.
+            print(f"\n[CLIENT] Ignoring malformed PDU from server: {e}")
+            continue
+        except OSError as e:
+            print(f"\n[DISCONNECTED] Connection to server lost: {e}")
+            _mark_disconnected(f"Connection lost: {e}")
+            break
+
         if msg is None:
             print("\n[DISCONNECTED] Server closed connection.")
+            _mark_disconnected("Server closed the connection.")
             break
 
         msg_type = msg.get("type")
@@ -195,6 +252,12 @@ def receiver(sock):
 
         with lock:
             last_recv_seq = seq
+
+        if msg_type == "PONG":
+            # Heartbeat reply (RFC 0001 §4.3) — silent by design so it
+            # doesn't spam the interactive prompt every ~30s.
+            last_pong_time = time.time()
+            continue
 
         if msg_type == "GAME_STATE_UPDATE" and msg.get("state", {}).get("phase") == "MULLIGAN":
             with lock:
@@ -212,6 +275,7 @@ def receiver(sock):
                 active_player = state.get("active_player")
                 my_hand = _extract_my_hand(state, my_id)
                 my_battlefield = _extract_my_battlefield(state, my_id)
+                graveyards = state.get("graveyard", {})
                 game_stack = state.get("stack", [])
                 life = state.get("life_totals", {})
                 if my_id and life:
@@ -245,6 +309,7 @@ def receiver(sock):
                     print(f"  Priority:      {prio}" + (" (YOU)" if prio == my_id else ""))
                 _print_hand_summary(my_hand)
                 _print_battlefield_summary(state)
+                _print_graveyard_summary(state)
                 print()
                 if phase == "CLEANUP" and active_player == my_id and len(my_hand) > 7:
                     print(f"  Cleanup: your hand has {len(my_hand)} cards, max is 7.")
@@ -291,6 +356,8 @@ def receiver(sock):
         elif msg_type == "PHASE_TRANSITION":
             with lock:
                 last_phase_seq = seq
+                current_phase = msg.get("to_phase")
+                active_player = msg.get("active_player")
             print(f"  {msg.get('from_phase')} → {msg.get('to_phase')}")
             print(f"  Active player: {msg.get('active_player')}  Turn: {msg.get('turn')}")
             if msg.get("to_phase") == "DECLARE_ATTACKERS" and msg.get("active_player") == my_id:
@@ -310,10 +377,6 @@ def receiver(sock):
 
         elif msg_type == "ERROR":
             print(f"  [!] {msg.get('code')}: {msg.get('message')}")
-
-        elif msg_type == "PONG":
-            global last_pong_time
-            last_pong_time = time.time()
 
         else:
             print(f"  {msg}")
@@ -360,6 +423,17 @@ def main():
     threading.Thread(target=receiver, args=(client,), daemon=True).start()
     threading.Thread(target=heartbeat, args=(client,), daemon=True).start()
 
+    def _safe_send(pdu) -> bool:
+        """Send a PDU, treating a dead socket as a clean disconnect instead
+        of an uncaught crash. Returns True on success."""
+        try:
+            send_pdu(client, pdu)
+            return True
+        except OSError as e:
+            print(f"\n[DISCONNECTED] Lost connection while sending: {e}")
+            _mark_disconnected(f"Send failed: {e}")
+            return False
+
     my_id = input("Player ID: ").strip()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -394,7 +468,12 @@ def main():
         ]
         print(f"Using default deck ({len(deck)} cards)")
 
-    send_pdu(client, player_ready(my_id, deck, seq_num))
+    try:
+        send_pdu(client, player_ready(my_id, deck, seq_num))
+    except OSError as e:
+        print(f"[DISCONNECTED] Could not reach server: {e}")
+        client.close()
+        return
     seq_num += 1
     print("[SENT] PLAYER_READY")
 
@@ -405,6 +484,10 @@ def main():
     _print_command_examples()
 
     while True:
+        if disconnected_event.is_set():
+            print(f"\n[CLIENT] Not connected to the server ({disconnect_reason['text']}). Exiting.")
+            break
+
         print("\n--------------------")
         _print_turn_status({
             "phase": current_phase,
@@ -415,6 +498,10 @@ def main():
         try:
             cmd = input("Command> ").strip()
         except EOFError:
+            break
+
+        if disconnected_event.is_set():
+            print(f"\n[CLIENT] Not connected to the server ({disconnect_reason['text']}). Exiting.")
             break
 
         if not cmd:
@@ -429,6 +516,7 @@ def main():
             mc = mulligan_count
             pseq = priority_seq
             bf = list(my_battlefield)
+            gy = dict(graveyards)
             opp = opponent_id
             phseq = last_phase_seq
             stseq = last_state_seq
@@ -442,30 +530,30 @@ def main():
                 print(f"  You mulliganed {mc} time(s). Use: bottom <{mc} card(s)>")
                 print(f"  Your hand: {hand}")
                 continue
-            send_pdu(client, mulligan_choice(True, [], echo))
-            print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom=[]")
+            if _safe_send(mulligan_choice(True, [], echo)):
+                print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom=[]")
 
         elif action == "bottom":
             cards = parts[1:]
             if len(cards) != mc:
                 print(f"  Need exactly {mc} card(s) to bottom. Got {len(cards)}.")
                 continue
-            send_pdu(client, mulligan_choice(True, cards, echo))
-            mulligan_count = 0
-            print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom={cards}")
+            if _safe_send(mulligan_choice(True, cards, echo)):
+                mulligan_count = 0
+                print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom={cards}")
 
         elif action == "mulligan":
-            send_pdu(client, mulligan_choice(False, [], echo))
-            mulligan_count += 1
-            print(f"[SENT] MULLIGAN_CHOICE keep=False (mulligan #{mulligan_count})")
+            if _safe_send(mulligan_choice(False, [], echo)):
+                mulligan_count += 1
+                print(f"[SENT] MULLIGAN_CHOICE keep=False (mulligan #{mulligan_count})")
 
         # ── PRIORITY_PASS ───────────────────────────────────────────
         elif action == "pass":
             if not has_priority:
                 print("  You do not currently hold priority; wait for the server to grant it.")
                 continue
-            send_pdu(client, priotity_pass(pseq))
-            print(f"[SENT] PRIORITY_PASS seq={pseq}")
+            if _safe_send(priotity_pass(pseq)):
+                print(f"[SENT] PRIORITY_PASS seq={pseq}")
 
         # ── PLAY shorthand ─────────────────────────────────────────
         elif action == "play":
@@ -483,12 +571,12 @@ def main():
                 print("  You do not currently hold priority; wait for the server to grant it.")
                 continue
             if is_land(card_id):
-                send_pdu(client, play_land(card_id, pseq))
-                print(f"[SENT] PLAY_LAND {card_id} seq={pseq}")
+                if _safe_send(play_land(card_id, pseq)):
+                    print(f"[SENT] PLAY_LAND {card_id} seq={pseq}")
             else:
                 payment = _mana_payment_for_card(card_id)
-                send_pdu(client, cast_spell(card_id, targets, payment, pseq))
-                print(f"[SENT] CAST_SPELL {card_id} targets={targets} mana={payment} seq={pseq}")
+                if _safe_send(cast_spell(card_id, targets, payment, pseq)):
+                    print(f"[SENT] CAST_SPELL {card_id} targets={targets} mana={payment} seq={pseq}")
 
         # ── PLAY_LAND ───────────────────────────────────────────────
         elif action == "land":
@@ -504,8 +592,8 @@ def main():
             if not has_priority:
                 print("  You do not currently hold priority; wait for the server to grant it.")
                 continue
-            send_pdu(client, play_land(card_id, pseq))
-            print(f"[SENT] PLAY_LAND {card_id} seq={pseq}")
+            if _safe_send(play_land(card_id, pseq)):
+                print(f"[SENT] PLAY_LAND {card_id} seq={pseq}")
 
         # ── CAST_SPELL ──────────────────────────────────────────────
         elif action == "cast":
@@ -524,8 +612,8 @@ def main():
                 print("  You do not currently hold priority; wait for the server to grant it.")
                 continue
             payment = _mana_payment_for_card(card_id)
-            send_pdu(client, cast_spell(card_id, targets, payment, pseq))
-            print(f"[SENT] CAST_SPELL {card_id} targets={targets} mana={payment} seq={pseq}")
+            if _safe_send(cast_spell(card_id, targets, payment, pseq)):
+                print(f"[SENT] CAST_SPELL {card_id} targets={targets} mana={payment} seq={pseq}")
 
         # ── ACTIVATE_ABILITY (tap land/creature for mana or damage) ───
         elif action == "tap":
@@ -535,12 +623,13 @@ def main():
                 continue
             perm_id = parts[1]
             targets = parts[2:] if len(parts) > 2 else []
-            perm = next((p for p in bf if p["instance_id"] == perm_id), None)
+            perm = next((p for p in bf if p.get("id") == perm_id or p.get("instance_id") == perm_id), None)
             if not perm:
                 print(f"  Permanent '{perm_id}' not on your battlefield.")
                 _print_battlefield()
                 continue
-            base = card_base_id(perm["card_id"])
+            card_id = perm.get("card_id") or perm.get("id") or perm.get("instance_id") or ""
+            base = card_base_id(card_id)
             mana_color = {"mountain": "R", "forest": "G", "island": "U", "plains": "W", "swamp": "B",
                           "llanowar_elves": "G", "elvish_mystic": "G"}.get(base)
             cost = {"tap": True, "mana": {}}
@@ -548,14 +637,14 @@ def main():
             if not has_priority:
                 print("  You do not currently hold priority; wait for the server to grant it.")
                 continue
-            send_pdu(client, activate_ability(perm_id, 0, targets, pseq, cost))
-            print(f"[SENT] ACTIVATE_ABILITY {perm_id} targets={targets}")
+            if _safe_send(activate_ability(perm_id, 0, targets, pseq, cost)):
+                print(f"[SENT] ACTIVATE_ABILITY {perm_id} targets={targets}")
 
         # ── DECLARE_ATTACKERS ─────────────────────────────────────────
         elif action == "attack":
             attackers = [{"creature_id": cid, "target": opp} for cid in parts[1:]]
-            send_pdu(client, declare_attackers(attackers, phseq))
-            print(f"[SENT] DECLARE_ATTACKERS attackers={parts[1:]} seq={phseq}")
+            if _safe_send(declare_attackers(attackers, phseq)):
+                print(f"[SENT] DECLARE_ATTACKERS attackers={parts[1:]} seq={phseq}")
 
         # ── DECLARE_BLOCKERS ─────────────────────────────────────────
         elif action == "block":
@@ -565,8 +654,8 @@ def main():
             blockers = []
             for i in range(1, len(parts), 2):
                 blockers.append({"creature_id": parts[i], "blocking_id": parts[i+1]})
-            send_pdu(client, declare_blockers(blockers, phseq))
-            print(f"[SENT] DECLARE_BLOCKERS blockers={blockers} seq={phseq}")
+            if _safe_send(declare_blockers(blockers, phseq)):
+                print(f"[SENT] DECLARE_BLOCKERS blockers={blockers} seq={phseq}")
 
         # ── ASSIGN_DAMAGE_ORDER ────────────────────────────────────────
         elif action == "order":
@@ -575,17 +664,17 @@ def main():
                 continue
             attacker_id = parts[1]
             blocker_order = parts[2:]
-            send_pdu(client, assign_damage_order(attacker_id, blocker_order, phseq))
-            print(f"[SENT] ASSIGN_DAMAGE_ORDER attacker={attacker_id} order={blocker_order} seq={phseq}")
+            if _safe_send(assign_damage_order(attacker_id, blocker_order, phseq)):
+                print(f"[SENT] ASSIGN_DAMAGE_ORDER attacker={attacker_id} order={blocker_order} seq={phseq}")
 
         # ── CONCEDE ─────────────────────────────────────────────────
         elif action == "concede":
-            send_pdu(client, {
+            if _safe_send({
                 "type": "CONCEDE",
                 "seq_num": rseq,
                 "player_id": my_id,
-            })
-            print(f"[SENT] CONCEDE seq={rseq}")
+            }):
+                print(f"[SENT] CONCEDE seq={rseq}")
 
         # ── DISCARD (Cleanup, hand > 7) ────────────────────────────────
         elif action == "discard":
@@ -593,19 +682,22 @@ def main():
             if not cards:
                 print("  Usage: discard <card1> <card2> ...")
                 continue
-            send_pdu(client, discard_pdu(cards, stseq))
-            print(f"[SENT] DISCARD card_ids={cards} seq={stseq}")
+            if _safe_send(discard_pdu(cards, stseq)):
+                print(f"[SENT] DISCARD card_ids={cards} seq={stseq}")
 
         # ── TRIGGER_CHOICE_RESPONSE (accept/decline a 'may' choice) ────
         elif action in ("yes", "no"):
             if choice_id is None:
                 print("  No pending trigger choice.")
                 continue
-            send_pdu(client, trigger_choice_response(choice_id, action == "yes", None, choice_seq))
-            print(f"[SENT] TRIGGER_CHOICE_RESPONSE trigger_id={choice_id} accept={action == 'yes'}")
+            if _safe_send(trigger_choice_response(choice_id, action == "yes", None, choice_seq)):
+                print(f"[SENT] TRIGGER_CHOICE_RESPONSE trigger_id={choice_id} accept={action == 'yes'}")
 
         elif action == "bf" or action == "battlefield":
             _print_battlefield()
+
+        elif action == "gy" or action == "graveyard":
+            _print_graveyard_summary({"graveyard": gy})
 
         elif action == "hand":
             print(f"  Hand: {hand}")
@@ -629,7 +721,7 @@ def main():
             print("Commands: keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
                   "land <card> | cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
                   "block <blocker> <attacker>... | order <attacker> <blocker>... | discard <cards...> | "
-                  "yes | no | bf | hand | verbose | concede | quit")
+                  "yes | no | bf | gy | hand | verbose | concede | quit")
             _print_command_examples()
 
     client.close()
