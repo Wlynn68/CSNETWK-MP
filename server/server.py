@@ -421,13 +421,11 @@ def handle_client(conn, addr):
                 break
 
             msg_type = message.get("type")
-            print(f"[RECEIVED] {msg_type}")
 
             if msg_type == "PING":
-                # Heartbeat is exempt from the priority token and doesn't
-                # touch shared game state; no need to serialize it.
                 handle_ping(conn, message)
             else:
+                print(f"[RECEIVED] {msg_type}")
                 # Everything else mutates shared state (players / gs) and
                 # must be processed atomically with respect to the other
                 # player's thread.

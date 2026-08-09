@@ -81,22 +81,29 @@ def _print_battlefield_summary(state: dict | None = None):
         state = {}
     battlefield_map = state.get("battlefield", {})
     if not isinstance(battlefield_map, dict) or not battlefield_map:
-        print("  Battlefield summary: (empty)")
+        print("  Battlefield: (empty)")
         return
 
-    print("  Battlefield summary:")
+    print("  Battlefield:")
     for pid, perms in battlefield_map.items():
         label = "You" if pid == my_id else pid
-        summary_items = []
+        if not perms:
+            print(f"    {label}: (empty)")
+            continue
+        print(f"    {label}:")
         for perm in perms:
-            card_id = perm.get("card_id") or perm.get("source") or perm.get("id") or "?"
-            name = _card_display_name(card_id) if card_id != "?" else "unknown"
+            perm_id = perm.get("id") or perm.get("instance_id") or "?"
+            card_id = perm.get("card_id") or perm_id
+            name = perm.get("card_name") or _card_display_name(card_id)
+            parts = [name]
             if perm.get("tapped"):
-                name += " [tapped]"
-            if perm.get("damage"):
-                name += f" (damage {perm.get('damage')})"
-            summary_items.append(name)
-        print(f"    {label}: {', '.join(summary_items) if summary_items else '(empty)'}")
+                parts.append("[TAPPED]")
+            if perm.get("summoning_sick"):
+                parts.append("[SICK]")
+            if perm.get("power") is not None:
+                dmg = perm.get("damage", 0)
+                parts.append(f"({perm['power']}/{perm['toughness']}" + (f", dmg:{dmg}" if dmg else "") + ")")
+            print(f"      {perm_id}: {' '.join(parts)}")
 
 
 def _print_graveyard_summary(state: dict | None = None):
@@ -104,14 +111,19 @@ def _print_graveyard_summary(state: dict | None = None):
         state = {}
     graveyard_map = state.get("graveyard", {})
     if not isinstance(graveyard_map, dict) or not graveyard_map:
-        print("  Graveyard summary: (empty)")
         return
 
-    print("  Graveyard summary:")
+    has_cards = any(cards for cards in graveyard_map.values())
+    if not has_cards:
+        return
+
+    print("  Graveyard:")
     for pid, cards in graveyard_map.items():
+        if not cards:
+            continue
         label = "You" if pid == my_id else pid
         names = [_card_display_name(c) for c in cards]
-        print(f"    {label}: {', '.join(names) if names else '(empty)'}")
+        print(f"    {label}: {', '.join(names)}")
 
 
 def _print_command_examples():
@@ -138,9 +150,15 @@ def _print_turn_status(state: dict | None = None):
     if turn is not None:
         print(f"  Turn: {turn}")
     print(f"  Current phase: {phase}")
-    print(f"  Active player: {active}")
+    active_label = active
+    if active == my_id:
+        active_label = f"{active} (YOU)"
+    print(f"  Active player: {active_label}")
     if prio:
-        print(f"  Priority: {prio}" + (" (YOU)" if prio == my_id else ""))
+        prio_label = prio
+        if prio == my_id:
+            prio_label = f"{prio} (YOU - respond!)"
+        print(f"  Priority: {prio_label}")
     else:
         print("  Priority: waiting for next grant")
     _print_battlefield_summary(state or {"battlefield": {my_id: my_battlefield} if my_id else {}})
@@ -333,7 +351,13 @@ def receiver(sock):
             })
             if grantee == my_id:
                 _print_hand_summary(my_hand)
-                print("  → pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target]")
+                phase_now = current_phase
+                if phase_now in ("UPKEEP", "DRAW", "BEGIN_COMBAT", "END_OF_COMBAT", "END_STEP"):
+                    print(f"  (In {phase_now} — type 'pass' to advance to the next phase)")
+                elif phase_now in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
+                    print("  → pass | play <card> | land <card> | cast <card> [target] | tap <perm_id> [target]")
+                else:
+                    print("  → pass | cast <card> [target] | tap <perm_id> [target]")
 
         elif msg_type == "STACK_PUSH":
             print(f"  Stack +{msg.get('item_type')}: {msg.get('source')} "
@@ -401,10 +425,12 @@ def _print_battlefield():
     for p in my_battlefield:
         tapped = " [TAPPED]" if p.get("tapped") else ""
         card_id = p.get("card_id") or p.get("id") or p.get("instance_id") or ""
-        card = get_card(card_id) if card_id else None
-        name = card["card_name"] if card else card_id
-        perm_id = p.get("instance_id") or p.get("id") or ""
-        print(f"    {perm_id}: {name}{tapped}")
+        name = p.get("card_name") or (_card_display_name(card_id) if card_id else "?")
+        perm_id = p.get("id") or p.get("instance_id") or ""
+        extras = ""
+        if p.get("power") is not None:
+            extras = f" ({p['power']}/{p['toughness']})"
+        print(f"    {perm_id}: {name}{tapped}{extras}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -530,20 +556,22 @@ def main():
                 print(f"  You mulliganed {mc} time(s). Use: bottom <{mc} card(s)>")
                 print(f"  Your hand: {hand}")
                 continue
-            if _safe_send(mulligan_choice(True, [], echo)):
+            if _safe_send(mulligan_choice(True, [], stseq)):
                 print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom=[]")
+                print("  Waiting for opponent to keep as well...")
 
         elif action == "bottom":
             cards = parts[1:]
             if len(cards) != mc:
                 print(f"  Need exactly {mc} card(s) to bottom. Got {len(cards)}.")
                 continue
-            if _safe_send(mulligan_choice(True, cards, echo)):
+            if _safe_send(mulligan_choice(True, cards, stseq)):
                 mulligan_count = 0
                 print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom={cards}")
+                print("  Waiting for opponent to keep as well...")
 
         elif action == "mulligan":
-            if _safe_send(mulligan_choice(False, [], echo)):
+            if _safe_send(mulligan_choice(False, [], stseq)):
                 mulligan_count += 1
                 print(f"[SENT] MULLIGAN_CHOICE keep=False (mulligan #{mulligan_count})")
 

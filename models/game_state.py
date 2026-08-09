@@ -141,7 +141,13 @@ class GameState:
     @staticmethod
     def _render_permanent(perm):
         card = get_card(perm["card_id"]) or {}
-        rendered = {"id": perm.get("id", perm.get("instance_id")), "tapped": perm.get("tapped", False)}
+        rendered = {
+            "id": perm.get("id", perm.get("instance_id")),
+            "card_id": perm["card_id"],
+            "card_name": card.get("card_name", perm["card_id"]),
+            "card_type": card.get("card_type", ""),
+            "tapped": perm.get("tapped", False),
+        }
         if is_creature(perm["card_id"]):
             power = (card.get("power") or 0) + perm.get("pump_power", 0)
             toughness = (card.get("toughness") or 0) + perm.get("pump_toughness", 0)
