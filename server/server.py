@@ -3,7 +3,7 @@ import threading
 import random
 import sys
 
-from models.protocol import send_pdu, receive_pdu, set_verbose
+from models.protocol import send_pdu, receive_pdu, set_verbose, InvalidPDUError, PDUTooLargeError
 from models.pdu import error, pong
 from models.cards import all_legal_card_ids
 from models.game_state import GameState
@@ -368,6 +368,27 @@ def handle_unknown_message(conn, message):
     send_pdu(conn, error("UNKNOWN_TYPE", f"Unsupported PDU type: {msg_type}", msg_type, seq_num))
 
 
+def handle_invalid_json(conn, detail: str):
+    """RFC 0001 §11: bytes that don't parse as valid UTF-8 JSON get ERROR
+    code INVALID_JSON. The action is discarded and the game state is left
+    unchanged; if the sender still holds priority, PRIORITY_GRANT is
+    re-issued so they can retry (§11 point 3). We have no seq_num to echo
+    since the payload never parsed, so we send 0 ("not available")."""
+    print(f"[INVALID_JSON] {detail}")
+    send_pdu(conn, error("INVALID_JSON", detail, None, 0))
+
+    pid = pid_for_conn(conn)
+    if (
+        pid
+        and gs is not None
+        and game_started
+        and not gs.game_over
+        and gs.engine is not None
+        and gs.engine.priority_player == pid
+    ):
+        gs.engine.grant_priority(pid)
+
+
 # ---------------------------------------------------------------------------
 # Connection handling
 # ---------------------------------------------------------------------------
@@ -377,7 +398,24 @@ def handle_client(conn, addr):
 
     try:
         while True:
-            message = receive_pdu(conn)
+            try:
+                message = receive_pdu(conn)
+            except PDUTooLargeError as e:
+                # Oversized frame: the body was deliberately not read off the
+                # socket, so the stream can no longer be trusted to be in
+                # sync. Best-effort notify, then treat like a disconnect.
+                print(f"[PDU_TOO_LARGE] {addr}: {e}")
+                try:
+                    send_pdu(conn, error("INVALID_JSON", str(e), None, 0))
+                except Exception:
+                    pass
+                break
+            except InvalidPDUError as e:
+                # Malformed-but-well-framed PDU: recoverable per RFC 0001
+                # §11 — report it and keep the connection (and game) going.
+                with game_lock:
+                    handle_invalid_json(conn, str(e))
+                continue
 
             if message is None:
                 break
