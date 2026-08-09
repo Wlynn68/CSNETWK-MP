@@ -207,6 +207,12 @@ class PriorityStackEngine:
         if pid != self.pending_choice["player_id"]:
             self.ctx.send_error(conn, "ILLEGAL_ACTION", "Not your choice.", msg, msg.get("seq_num"))
             return
+        # RFC 0001 §11: TRIGGER_CHOICE_INVALID — the response references an
+        # unknown trigger_id (doesn't match the TRIGGER_CHOICE we sent).
+        if msg.get("trigger_id") != self.pending_choice.get("trigger_id"):
+            self.ctx.send_error(conn, "TRIGGER_CHOICE_INVALID",
+                f"Unknown trigger_id '{msg.get('trigger_id')}'.", msg, msg.get("seq_num"))
+            return
 
         choice = self.pending_choice
         self.pending_choice = None
@@ -1138,6 +1144,7 @@ class PriorityStackEngine:
             return
         seq = self.ctx.next_seq()
         pay = spell_effect_for(leak_item["card_id"]).get("pay_generic", 3)
+        trigger_id = self._new_trigger_id()
         self.pending_choice = {
             "kind": "mana_leak",
             "seq_num": seq,
@@ -1145,11 +1152,12 @@ class PriorityStackEngine:
             "leak_item": leak_item,
             "target_item": target_item,
             "pay": pay,
+            "trigger_id": trigger_id,
         }
         self.ctx.send_to(target_item["controller"], {
             "type": "TRIGGER_CHOICE",
             "seq_num": seq,
-            "trigger_id": self._new_trigger_id(),
+            "trigger_id": trigger_id,
             "source_id": leak_item["card_id"],
             "effect_summary": f"Pay {{{pay}}} or {target_item['card_id']} is countered.",
             "requires_target": False,
