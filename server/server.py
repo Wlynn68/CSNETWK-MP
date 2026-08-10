@@ -273,7 +273,6 @@ def handle_mulligan_choice(conn, message):
 
 def begin_in_game():
     gs.turn_number = 1
-    gs.current_phase = "UNTAP"
     print()
     print("=" * 60)
     print(f"[GAME] Both players kept. Beginning turn 1. Active player: {gs.active_player}")
@@ -421,11 +420,13 @@ def handle_client(conn, addr):
                 break
 
             msg_type = message.get("type")
+            print(f"[RECEIVED] {msg_type}")
 
             if msg_type == "PING":
+                # Heartbeat is exempt from the priority token and doesn't
+                # touch shared game state; no need to serialize it.
                 handle_ping(conn, message)
             else:
-                print(f"[RECEIVED] {msg_type}")
                 # Everything else mutates shared state (players / gs) and
                 # must be processed atomically with respect to the other
                 # player's thread.
