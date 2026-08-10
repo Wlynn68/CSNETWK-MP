@@ -284,12 +284,19 @@ class PriorityStackEngine:
     # Phase / Turn Transitions
 
     def begin_turn(self):
+        # RFC 0001 s7.2: announce entry into UNTAP first (from whatever the
+        # previous phase actually was), *then* untap/reset, *then* announce
+        # the UNTAP -> UPKEEP transition. Untapping must never happen silently.
+        prev_phase = self.ctx.current_phase
+        self._broadcast_phase(prev_phase, "UNTAP")
+
         self.land_played_this_turn.clear()
         self._empty_mana_pools()
         active = self.ctx.active_player
         self.untap_all(active)
         self._clear_summoning_sickness(active)
         self.ctx.broadcast_game_state()
+
         self._broadcast_phase("UNTAP", "UPKEEP")
         self.passes_since_action = 0
         self.grant_priority(active)
@@ -779,7 +786,10 @@ class PriorityStackEngine:
 
         spell = spell_effect_for(card_id)
         card_type = card.get("card_type")
-        is_permanent_spell = is_creature(card_id) or card_type == "Artifact" or card_type == "Artifact Creature"
+        is_permanent_spell = (
+            is_creature(card_id)
+            or card_type in ("Artifact", "Artifact Creature", "Enchantment")
+        )
         if spell is None and not is_permanent_spell:
             self.ctx.send_error(conn, "ILLEGAL_ACTION", f"Cannot cast {card_id}.", msg, msg.get("seq_num"))
             return
@@ -1116,6 +1126,12 @@ class PriorityStackEngine:
                 perm = self._make_permanent(card_id, summoning_sickness=False)
                 self.ctx.game_data[controller]["battlefield"].append(perm)
                 state_changes.append({"change_type": "ENTER_BATTLEFIELD", "target": perm["id"]})
+                self._emit_resolve(item_id, "RESOLVED", state_changes)
+            elif is_enchantment(card_id):
+                perm = self._make_permanent(card_id, summoning_sickness=False)
+                self.ctx.game_data[controller]["battlefield"].append(perm)
+                state_changes.append({"change_type": "ENTER_BATTLEFIELD", "target": perm["id"]})
+                self._resolve_etb(controller, perm, targets, state_changes)
                 self._emit_resolve(item_id, "RESOLVED", state_changes)
             else:
                 self.ctx.game_data[controller]["graveyard"].append(card_id)
