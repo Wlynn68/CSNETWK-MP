@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import socket
 import sys
 import threading
@@ -38,6 +39,14 @@ last_phase_seq = 0       # seq_num of most recent PHASE_TRANSITION (echoed by co
 last_state_seq = 0       # seq_num of most recent GAME_STATE_UPDATE (echoed by DISCARD)
 last_recv_seq = 0        # seq_num of most recently received PDU of any type (echoed by CONCEDE)
 lock = threading.Lock()
+
+# Set by the receiver thread whenever it sees the server's response to our
+# most recent PLAYER_READY (either an accepting GAME_STATE_UPDATE[phase=LOBBY]
+# or a rejecting ERROR whose rejected_action == "PLAYER_READY"). The sender
+# blocks on this so it only advances seq_num when PLAYER_READY was actually
+# accepted, and can retry (with a fresh ID if needed) on rejection instead
+# of burning a sequence number.
+player_ready_ack = queue.Queue()
 
 
 def _extract_my_hand(state: dict, pid: str | None) -> list[str]:
@@ -81,29 +90,22 @@ def _print_battlefield_summary(state: dict | None = None):
         state = {}
     battlefield_map = state.get("battlefield", {})
     if not isinstance(battlefield_map, dict) or not battlefield_map:
-        print("  Battlefield: (empty)")
+        print("  Battlefield summary: (empty)")
         return
 
-    print("  Battlefield:")
+    print("  Battlefield summary:")
     for pid, perms in battlefield_map.items():
         label = "You" if pid == my_id else pid
-        if not perms:
-            print(f"    {label}: (empty)")
-            continue
-        print(f"    {label}:")
+        summary_items = []
         for perm in perms:
-            perm_id = perm.get("id") or perm.get("instance_id") or "?"
-            card_id = perm.get("card_id") or perm_id
-            name = perm.get("card_name") or _card_display_name(card_id)
-            parts = [name]
+            card_id = perm.get("card_id") or perm.get("source") or perm.get("id") or "?"
+            name = _card_display_name(card_id) if card_id != "?" else "unknown"
             if perm.get("tapped"):
-                parts.append("[TAPPED]")
-            if perm.get("summoning_sick"):
-                parts.append("[SICK]")
-            if perm.get("power") is not None:
-                dmg = perm.get("damage", 0)
-                parts.append(f"({perm['power']}/{perm['toughness']}" + (f", dmg:{dmg}" if dmg else "") + ")")
-            print(f"      {perm_id}: {' '.join(parts)}")
+                name += " [tapped]"
+            if perm.get("damage"):
+                name += f" (damage {perm.get('damage')})"
+            summary_items.append(name)
+        print(f"    {label}: {', '.join(summary_items) if summary_items else '(empty)'}")
 
 
 def _print_graveyard_summary(state: dict | None = None):
@@ -111,19 +113,14 @@ def _print_graveyard_summary(state: dict | None = None):
         state = {}
     graveyard_map = state.get("graveyard", {})
     if not isinstance(graveyard_map, dict) or not graveyard_map:
+        print("  Graveyard summary: (empty)")
         return
 
-    has_cards = any(cards for cards in graveyard_map.values())
-    if not has_cards:
-        return
-
-    print("  Graveyard:")
+    print("  Graveyard summary:")
     for pid, cards in graveyard_map.items():
-        if not cards:
-            continue
         label = "You" if pid == my_id else pid
         names = [_card_display_name(c) for c in cards]
-        print(f"    {label}: {', '.join(names)}")
+        print(f"    {label}: {', '.join(names) if names else '(empty)'}")
 
 
 def _print_command_examples():
@@ -150,15 +147,9 @@ def _print_turn_status(state: dict | None = None):
     if turn is not None:
         print(f"  Turn: {turn}")
     print(f"  Current phase: {phase}")
-    active_label = active
-    if active == my_id:
-        active_label = f"{active} (YOU)"
-    print(f"  Active player: {active_label}")
+    print(f"  Active player: {active}")
     if prio:
-        prio_label = prio
-        if prio == my_id:
-            prio_label = f"{prio} (YOU - respond!)"
-        print(f"  Priority: {prio_label}")
+        print(f"  Priority: {prio}" + (" (YOU)" if prio == my_id else ""))
     else:
         print("  Priority: waiting for next grant")
     _print_battlefield_summary(state or {"battlefield": {my_id: my_battlefield} if my_id else {}})
@@ -307,6 +298,7 @@ def receiver(sock):
                 w = state.get("waiting_for", [])
                 if w:
                     print(f"  Waiting for:   {w}")
+                player_ready_ack.put(("ok", msg))
 
             elif phase == "MULLIGAN":
                 print(f"  Life totals:   {state.get('life_totals')}")
@@ -351,13 +343,7 @@ def receiver(sock):
             })
             if grantee == my_id:
                 _print_hand_summary(my_hand)
-                phase_now = current_phase
-                if phase_now in ("UPKEEP", "DRAW", "BEGIN_COMBAT", "END_OF_COMBAT", "END_STEP"):
-                    print(f"  (In {phase_now} — type 'pass' to advance to the next phase)")
-                elif phase_now in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
-                    print("  → pass | play <card> | land <card> | cast <card> [target] | tap <perm_id> [target]")
-                else:
-                    print("  → pass | cast <card> [target] | tap <perm_id> [target]")
+                print("  → pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target]")
 
         elif msg_type == "STACK_PUSH":
             print(f"  Stack +{msg.get('item_type')}: {msg.get('source')} "
@@ -397,10 +383,29 @@ def receiver(sock):
             print(f"  Loser:  {msg.get('loser_id')}")
             print(f"  Reason: {msg.get('reason')}")
             print()
-            print("  Send PLAYER_READY to start a new game.")
+            print("  Type 'ready' to send a fresh PLAYER_READY and queue for a new game.")
+            with lock:
+                # The finished game's phase/hand/battlefield/priority state is
+                # meaningless now — clear it so the client doesn't keep acting
+                # (or displaying) like a game is still in progress until the
+                # next one actually starts.
+                current_phase = "LOBBY"
+                active_player = None
+                has_priority = False
+                priority_holder = None
+                my_hand = []
+                my_battlefield = []
+                graveyards = {}
+                game_stack = []
+                pending_choice_id = None
+                pending_choice_seq = 0
 
         elif msg_type == "ERROR":
-            print(f"  [!] {msg.get('code')}: {msg.get('message')}")
+                                    print(f"  [!] {msg.get('code')}: {msg.get('message')}")
+                                    # Only relevant while we're mid-handshake waiting on PLAYER_READY;
+                                    # _send_player_ready is the sole consumer of this queue, and it
+                                    # stops reading from it once PLAYER_READY has been accepted.
+                                    player_ready_ack.put(("error", msg))
 
         else:
             print(f"  {msg}")
@@ -425,12 +430,10 @@ def _print_battlefield():
     for p in my_battlefield:
         tapped = " [TAPPED]" if p.get("tapped") else ""
         card_id = p.get("card_id") or p.get("id") or p.get("instance_id") or ""
-        name = p.get("card_name") or (_card_display_name(card_id) if card_id else "?")
-        perm_id = p.get("id") or p.get("instance_id") or ""
-        extras = ""
-        if p.get("power") is not None:
-            extras = f" ({p['power']}/{p['toughness']})"
-        print(f"    {perm_id}: {name}{tapped}{extras}")
+        card = get_card(card_id) if card_id else None
+        name = card["card_name"] if card else card_id
+        perm_id = p.get("instance_id") or p.get("id") or ""
+        print(f"    {perm_id}: {name}{tapped}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -466,45 +469,105 @@ def main():
     deck1_path = os.path.join(root, "jason files", "deck1.json")
     deck2_path = os.path.join(root, "jason files", "deck2.json")
 
-    print("Deck options: 1=deck1.json (red burn) | 2=deck2.json (UW control) | c=custom | d=default")
-    deck_choice = input("Deck [1]: ").strip().lower() or "1"
+    def _choose_deck():
+        print("Deck options: 1=deck1.json (red burn) | 2=deck2.json (UW control) | c=custom | d=default")
+        deck_choice = input("Deck [1]: ").strip().lower() or "1"
 
-    if deck_choice == "1":
-        with open(deck1_path, encoding="utf-8") as f:
-            deck = json.load(f)["deck_list"]
-        print(f"Loaded deck1 ({len(deck)} cards)")
-    elif deck_choice == "2":
-        with open(deck2_path, encoding="utf-8") as f:
-            deck = json.load(f)["deck_list"]
-        print(f"Loaded deck2 ({len(deck)} cards)")
-    elif deck_choice == "c":
-        print("Enter card IDs one per line. Blank line to finish:")
-        deck = []
+        if deck_choice == "1":
+            with open(deck1_path, encoding="utf-8") as f:
+                chosen = json.load(f)["deck_list"]
+            print(f"Loaded deck1 ({len(chosen)} cards)")
+        elif deck_choice == "2":
+            with open(deck2_path, encoding="utf-8") as f:
+                chosen = json.load(f)["deck_list"]
+            print(f"Loaded deck2 ({len(chosen)} cards)")
+        elif deck_choice == "c":
+            print("Enter card IDs one per line. Blank line to finish:")
+            chosen = []
+            while True:
+                c = input("  ").strip()
+                if not c:
+                    break
+                chosen.append(c)
+        else:
+            chosen = [
+                "lightning_bolt_001", "lightning_bolt_002", "lightning_bolt_003",
+                "shock_001", "shock_002",
+                "mountain_001", "mountain_002", "mountain_003", "mountain_004",
+                "mountain_005", "mountain_006", "mountain_007",
+            ]
+            print(f"Using default deck ({len(chosen)} cards)")
+        return chosen
+
+    deck = _choose_deck()
+
+    def _send_player_ready() -> bool:
+        """Run the PLAYER_READY handshake to completion: keep sending/fixing
+        until the server accepts it, the connection dies, or the user bails
+        out of an unrecoverable rejection. Returns True iff accepted."""
+        nonlocal deck
+        global seq_num, my_id
         while True:
-            c = input("  ").strip()
-            if not c:
-                break
-            deck.append(c)
-    else:
-        deck = [
-            "lightning_bolt_001", "lightning_bolt_002", "lightning_bolt_003",
-            "shock_001", "shock_002",
-            "mountain_001", "mountain_002", "mountain_003", "mountain_004",
-            "mountain_005", "mountain_006", "mountain_007",
-        ]
-        print(f"Using default deck ({len(deck)} cards)")
+            try:
+                send_pdu(client, player_ready(my_id, deck, seq_num))
+            except OSError as e:
+                print(f"[DISCONNECTED] Could not reach server: {e}")
+                _mark_disconnected(f"Could not send PLAYER_READY: {e}")
+                return False
+            print(f"[SENT] PLAYER_READY id={my_id} seq={seq_num}")
 
-    try:
-        send_pdu(client, player_ready(my_id, deck, seq_num))
-    except OSError as e:
-        print(f"[DISCONNECTED] Could not reach server: {e}")
+            try:
+                kind, ack_msg = player_ready_ack.get(timeout=10)
+            except queue.Empty:
+                if disconnected_event.is_set():
+                    print(f"\n[CLIENT] Not connected to the server ({disconnect_reason['text']}).")
+                    return False
+                print("[CLIENT] No response to PLAYER_READY within 10s; resending...")
+                continue
+
+            if kind == "ok":
+                # Server accepted it (broadcast the LOBBY GAME_STATE_UPDATE) —
+                # *now* it's safe to consume this seq_num.
+                seq_num += 1
+                return True
+
+            # kind == "error": PLAYER_READY was rejected. Don't advance
+            # seq_num. Each code either gets a fix before we retry, or we
+            # stop and let the user decide — we never resend the exact same
+            # PDU unmodified, since that would just get rejected again
+            # forever.
+            code = ack_msg.get("code")
+            message = ack_msg.get("message")
+
+            if code in ("DUPLICATE_ID", "INVALID_ID"):
+                my_id = input(f"  [{code}] {message} Enter a different Player ID: ").strip()
+                continue
+
+            if code == "ILLEGAL_DECK":
+                print(f"  [{code}] {message}")
+                deck = _choose_deck()
+                continue
+
+            # GAME_IN_PROGRESS, LOBBY_FULL, or anything else: retrying
+            # immediately won't fix it. Stop spamming and let the user decide.
+            print(f"  [{code}] {message}")
+            choice = input("  Retry PLAYER_READY? [y/N]: ").strip().lower()
+            if choice != "y":
+                print("[CLIENT] Not queued for a game.")
+                return False
+            # User explicitly asked to retry — give the server a moment
+            # before trying again so we don't just re-trigger the same
+            # rejection.
+            time.sleep(2)
+
+    _send_player_ready()
+    if disconnected_event.is_set():
+        print(f"\n[CLIENT] Not connected to the server ({disconnect_reason['text']}). Exiting.")
         client.close()
         return
-    seq_num += 1
-    print("[SENT] PLAYER_READY")
 
     print("\nWaiting for game to start...")
-    print("Commands: keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
+    print("Commands: ready | keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
           "land <card> | cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
           "block <blocker> <attacker>... | order <attacker> <blocker>... | yes | no | concede | quit")
     _print_command_examples()
@@ -550,28 +613,37 @@ def main():
             choice_seq = pending_choice_seq
             choice_id = pending_choice_id
 
+        # ── PLAYER_READY (re-queue after GAME_OVER) ───────────────────
+        if action == "ready":
+            mulligan_count = 0
+            change = input(f"  Keep current deck ({len(deck)} cards)? [Y/n]: ").strip().lower()
+            if change == "n":
+                deck = _choose_deck()
+            _send_player_ready()
+            if disconnected_event.is_set():
+                print(f"\n[CLIENT] Not connected to the server ({disconnect_reason['text']}).")
+            continue
+
         # ── MULLIGAN commands ──────────────────────────────────────
         if action == "keep" and len(parts) == 1:
             if mc > 0:
                 print(f"  You mulliganed {mc} time(s). Use: bottom <{mc} card(s)>")
                 print(f"  Your hand: {hand}")
                 continue
-            if _safe_send(mulligan_choice(True, [], stseq)):
+            if _safe_send(mulligan_choice(True, [], echo)):
                 print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom=[]")
-                print("  Waiting for opponent to keep as well...")
 
         elif action == "bottom":
             cards = parts[1:]
             if len(cards) != mc:
                 print(f"  Need exactly {mc} card(s) to bottom. Got {len(cards)}.")
                 continue
-            if _safe_send(mulligan_choice(True, cards, stseq)):
+            if _safe_send(mulligan_choice(True, cards, echo)):
                 mulligan_count = 0
                 print(f"[SENT] MULLIGAN_CHOICE keep=True, cards_to_bottom={cards}")
-                print("  Waiting for opponent to keep as well...")
 
         elif action == "mulligan":
-            if _safe_send(mulligan_choice(False, [], stseq)):
+            if _safe_send(mulligan_choice(False, [], echo)):
                 mulligan_count += 1
                 print(f"[SENT] MULLIGAN_CHOICE keep=False (mulligan #{mulligan_count})")
 
@@ -746,7 +818,7 @@ def main():
             break
 
         else:
-            print("Commands: keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
+            print("Commands: ready | keep | mulligan | bottom <cards...> | pass | play <card> [target] | "
                   "land <card> | cast <card> [target] | tap <perm_id> [target] | attack <creature>... | "
                   "block <blocker> <attacker>... | order <attacker> <blocker>... | discard <cards...> | "
                   "yes | no | bf | gy | hand | verbose | concede | quit")
