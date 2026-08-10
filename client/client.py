@@ -39,6 +39,7 @@ last_phase_seq = 0       # seq_num of most recent PHASE_TRANSITION (echoed by co
 last_state_seq = 0       # seq_num of most recent GAME_STATE_UPDATE (echoed by DISCARD)
 last_recv_seq = 0        # seq_num of most recently received PDU of any type (echoed by CONCEDE)
 lock = threading.Lock()
+print_lock = threading.Lock()  # keeps each thread's multi-line print block atomic
 
 # Set by the receiver thread whenever it sees the server's response to our
 # most recent PLAYER_READY (either an accepting GAME_STATE_UPDATE[phase=LOBBY]
@@ -273,142 +274,156 @@ def receiver(sock):
                 last_hand_seq = seq
                 my_hand = _extract_my_hand(msg.get("state", {}), my_id)
 
-        print(f"\n── {msg_type} (seq={seq}) ──")
+        with print_lock:
+            print(f"\n── {msg_type} (seq={seq}) ──")
 
-        if msg_type == "GAME_STATE_UPDATE":
-            state = msg.get("state", {})
-            phase = state.get("phase")
-            with lock:
-                last_state_seq = seq
-                current_phase = phase
-                active_player = state.get("active_player")
-                my_hand = _extract_my_hand(state, my_id)
-                my_battlefield = _extract_my_battlefield(state, my_id)
-                graveyards = state.get("graveyard", {})
-                game_stack = state.get("stack", [])
-                life = state.get("life_totals", {})
-                if my_id and life:
-                    opponent_id = next((p for p in life if p != my_id), None)
+            if msg_type == "GAME_STATE_UPDATE":
+                state = msg.get("state", {})
+                phase = state.get("phase")
+                with lock:
+                    last_state_seq = seq
+                    current_phase = phase
+                    active_player = state.get("active_player")
+                    my_hand = _extract_my_hand(state, my_id)
+                    my_battlefield = _extract_my_battlefield(state, my_id)
+                    graveyards = state.get("graveyard", {})
+                    game_stack = state.get("stack", [])
+                    life = state.get("life_totals", {})
+                    if my_id and life:
+                        opponent_id = next((p for p in life if p != my_id), None)
+                    if "priority_player" in state:
+                        priority_holder = state.get("priority_player")
+                        has_priority = (priority_holder == my_id)
 
-            print(f"  Phase: {phase}")
-            _print_turn_status(state)
+                print(f"  Phase: {phase}")
+                _print_turn_status(state)
 
-            if phase == "LOBBY":
-                print(f"  Players ready: {state.get('players_ready')}/2")
-                w = state.get("waiting_for", [])
-                if w:
-                    print(f"  Waiting for:   {w}")
-                player_ready_ack.put(("ok", msg))
+                if phase == "LOBBY":
+                    print(f"  Players ready: {state.get('players_ready')}/2")
+                    w = state.get("waiting_for", [])
+                    if w:
+                        print(f"  Waiting for:   {w}")
+                    player_ready_ack.put(("ok", msg))
 
-            elif phase == "MULLIGAN":
-                print(f"  Life totals:   {state.get('life_totals')}")
-                print(f"  Your hand:     {state.get('hand')}")
-                print(f"  Opponent hand: {state.get('hand_counts')}")
-                print(f"  Library sizes: {state.get('library_counts')}")
+                elif phase == "MULLIGAN":
+                    print(f"  Life totals:   {state.get('life_totals')}")
+                    print(f"  Your hand:     {state.get('hand')}")
+                    print(f"  Opponent hand: {state.get('hand_counts')}")
+                    print(f"  Library sizes: {state.get('library_counts')}")
+                    print()
+                    print("  Commands: keep | mulligan | bottom <card1> <card2> ...")
+
+                else:
+                    print(f"  Turn:          {state.get('turn')}")
+                    print(f"  Active player: {state.get('active_player')}")
+                    print(f"  Life totals:   {state.get('life_totals')}")
+                    print(f"  Opponent hand: {state.get('hand_counts')}")
+                    print(f"  Stack:         {state.get('stack')}")
+                    prio = state.get("priority_player")
+                    if prio:
+                        print(f"  Priority:      {prio}" + (" (YOU)" if prio == my_id else ""))
+                    _print_hand_summary(my_hand)
+                    _print_battlefield_summary(state)
+                    _print_graveyard_summary(state)
+                    print()
+                    if phase == "CLEANUP" and active_player == my_id and len(my_hand) > 7:
+                        print(f"  Cleanup: your hand has {len(my_hand)} cards, max is 7.")
+                        print(f"  → discard <card1> <card2> ... (must discard {len(my_hand) - 7} card(s))")
+                    else:
+                        print("  Commands: pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target] | concede")
+
+            elif msg_type == "PRIORITY_GRANT":
+                grantee = msg.get("player_id")
+                with lock:
+                    priority_seq = seq
+                    has_priority = (grantee == my_id)
+                    priority_holder = grantee
+                print(f"  Priority granted to: {grantee}" + (" (YOU — respond!)" if grantee == my_id else ""))
+                print(f"  Time limit: {msg.get('time_limit_ms')}ms")
+                _print_turn_status({
+                    "phase": current_phase,
+                    "active_player": active_player,
+                    "priority_player": grantee,
+                    "turn": None,
+                })
+                if grantee == my_id:
+                    _print_hand_summary(my_hand)
+                    print("  → pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target]")
+
+            elif msg_type == "STACK_PUSH":
+                print(f"  Stack +{msg.get('item_type')}: {msg.get('source')} "
+                      f"(id={msg.get('stack_item_id')}, ctrl={msg.get('controller')})")
+                print(f"  Targets: {msg.get('targets')}")
+
+            elif msg_type == "STACK_RESOLVE":
+                print(f"  Resolved {msg.get('stack_item_id')}: {msg.get('result')}")
+                changes = msg.get("state_changes", {})
+                if changes:
+                    print(f"  Changes: {json.dumps(changes)}")
+
+            elif msg_type == "TRIGGER_CHOICE":
+                with lock:
+                    pending_choice_seq = seq
+                    pending_choice_id = msg.get("trigger_id")
+                print(f"  Choice required: {msg.get('effect_summary')}")
+                print("  → yes (accept/pay) | no (decline)")
+
+            elif msg_type == "PHASE_TRANSITION":
+                with lock:
+                    last_phase_seq = seq
+                    current_phase = msg.get("to_phase")
+                    active_player = msg.get("active_player")
+                print(f"  {msg.get('from_phase')} → {msg.get('to_phase')}")
+                print(f"  Active player: {msg.get('active_player')}  Turn: {msg.get('turn')}")
+                if msg.get("to_phase") == "DECLARE_ATTACKERS" and msg.get("active_player") == my_id:
+                    print("  → attack <creature_id> [creature_id ...]  (or 'attack' with none to skip)")
+                elif msg.get("to_phase") == "DECLARE_BLOCKERS" and msg.get("active_player") != my_id:
+                    print("  → block <blocker_id> <attacker_id> [...]  (or 'block' with none to skip)")
+                elif msg.get("to_phase") == "ASSIGN_DAMAGE_ORDER" and msg.get("active_player") == my_id:
+                    print("  → order <attacker_id> <blocker_id> [blocker_id ...]")
+
+            elif msg_type == "GAME_OVER":
+                print(f"  GAME OVER!")
+                print(f"  Winner: {msg.get('winner_id')}")
+                print(f"  Loser:  {msg.get('loser_id')}")
+                print(f"  Reason: {msg.get('reason')}")
                 print()
-                print("  Commands: keep | mulligan | bottom <card1> <card2> ...")
+                print("  Type 'ready' to send a fresh PLAYER_READY and queue for a new game.")
+                with lock:
+                    # The finished game's phase/hand/battlefield/priority state is
+                    # meaningless now — clear it so the client doesn't keep acting
+                    # (or displaying) like a game is still in progress until the
+                    # next one actually starts.
+                    current_phase = "LOBBY"
+                    active_player = None
+                    has_priority = False
+                    priority_holder = None
+                    my_hand = []
+                    my_battlefield = []
+                    graveyards = {}
+                    game_stack = []
+                    pending_choice_id = None
+                    pending_choice_seq = 0
+
+            elif msg_type == "ERROR":
+                print(f"  [!] {msg.get('code')}: {msg.get('message')}")
+                # The server just told us our local belief about priority was
+                # wrong (we tried to act without it). Clear it rather than
+                # leaving the stale holder/flag around — better to honestly
+                # show "waiting for next grant" than a confidently wrong one.
+                if msg.get("code") == "NOT_YOUR_PRIORITY":
+                    with lock:
+                        has_priority = False
+                        priority_holder = None
+                # Only unblock the PLAYER_READY handshake for errors that are
+                # actually rejecting PLAYER_READY — not errors from some other
+                # in-flight PDU.
+                
+                    
+                player_ready_ack.put(("error", msg))
 
             else:
-                print(f"  Turn:          {state.get('turn')}")
-                print(f"  Active player: {state.get('active_player')}")
-                print(f"  Life totals:   {state.get('life_totals')}")
-                print(f"  Opponent hand: {state.get('hand_counts')}")
-                print(f"  Stack:         {state.get('stack')}")
-                prio = state.get("priority_player")
-                if prio:
-                    print(f"  Priority:      {prio}" + (" (YOU)" if prio == my_id else ""))
-                _print_hand_summary(my_hand)
-                _print_battlefield_summary(state)
-                _print_graveyard_summary(state)
-                print()
-                if phase == "CLEANUP" and active_player == my_id and len(my_hand) > 7:
-                    print(f"  Cleanup: your hand has {len(my_hand)} cards, max is 7.")
-                    print(f"  → discard <card1> <card2> ... (must discard {len(my_hand) - 7} card(s))")
-                else:
-                    print("  Commands: pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target] | concede")
-
-        elif msg_type == "PRIORITY_GRANT":
-            grantee = msg.get("player_id")
-            with lock:
-                priority_seq = seq
-                has_priority = (grantee == my_id)
-                priority_holder = grantee
-            print(f"  Priority granted to: {grantee}" + (" (YOU — respond!)" if grantee == my_id else ""))
-            print(f"  Time limit: {msg.get('time_limit_ms')}ms")
-            _print_turn_status({
-                "phase": current_phase,
-                "active_player": active_player,
-                "priority_player": grantee,
-                "turn": None,
-            })
-            if grantee == my_id:
-                _print_hand_summary(my_hand)
-                print("  → pass | play <card> [target] | land <card> | cast <card> [target] | tap <perm_id> [target]")
-
-        elif msg_type == "STACK_PUSH":
-            print(f"  Stack +{msg.get('item_type')}: {msg.get('source')} "
-                  f"(id={msg.get('stack_item_id')}, ctrl={msg.get('controller')})")
-            print(f"  Targets: {msg.get('targets')}")
-
-        elif msg_type == "STACK_RESOLVE":
-            print(f"  Resolved {msg.get('stack_item_id')}: {msg.get('result')}")
-            changes = msg.get("state_changes", {})
-            if changes:
-                print(f"  Changes: {json.dumps(changes)}")
-
-        elif msg_type == "TRIGGER_CHOICE":
-            with lock:
-                pending_choice_seq = seq
-                pending_choice_id = msg.get("trigger_id")
-            print(f"  Choice required: {msg.get('effect_summary')}")
-            print("  → yes (accept/pay) | no (decline)")
-
-        elif msg_type == "PHASE_TRANSITION":
-            with lock:
-                last_phase_seq = seq
-                current_phase = msg.get("to_phase")
-                active_player = msg.get("active_player")
-            print(f"  {msg.get('from_phase')} → {msg.get('to_phase')}")
-            print(f"  Active player: {msg.get('active_player')}  Turn: {msg.get('turn')}")
-            if msg.get("to_phase") == "DECLARE_ATTACKERS" and msg.get("active_player") == my_id:
-                print("  → attack <creature_id> [creature_id ...]  (or 'attack' with none to skip)")
-            elif msg.get("to_phase") == "DECLARE_BLOCKERS" and msg.get("active_player") != my_id:
-                print("  → block <blocker_id> <attacker_id> [...]  (or 'block' with none to skip)")
-            elif msg.get("to_phase") == "ASSIGN_DAMAGE_ORDER" and msg.get("active_player") == my_id:
-                print("  → order <attacker_id> <blocker_id> [blocker_id ...]")
-
-        elif msg_type == "GAME_OVER":
-            print(f"  GAME OVER!")
-            print(f"  Winner: {msg.get('winner_id')}")
-            print(f"  Loser:  {msg.get('loser_id')}")
-            print(f"  Reason: {msg.get('reason')}")
-            print()
-            print("  Type 'ready' to send a fresh PLAYER_READY and queue for a new game.")
-            with lock:
-                # The finished game's phase/hand/battlefield/priority state is
-                # meaningless now — clear it so the client doesn't keep acting
-                # (or displaying) like a game is still in progress until the
-                # next one actually starts.
-                current_phase = "LOBBY"
-                active_player = None
-                has_priority = False
-                priority_holder = None
-                my_hand = []
-                my_battlefield = []
-                graveyards = {}
-                game_stack = []
-                pending_choice_id = None
-                pending_choice_seq = 0
-
-        elif msg_type == "ERROR":
-                                    print(f"  [!] {msg.get('code')}: {msg.get('message')}")
-                                    # Only relevant while we're mid-handshake waiting on PLAYER_READY;
-                                    # _send_player_ready is the sole consumer of this queue, and it
-                                    # stops reading from it once PLAYER_READY has been accepted.
-                                    player_ready_ack.put(("error", msg))
-
-        else:
-            print(f"  {msg}")
+                print(f"  {msg}")
 
 # ── Command helpers ─────────────────────────────────────────────────────────────
 
@@ -438,7 +453,7 @@ def _print_battlefield():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global seq_num, mulligan_count, my_id
+    global seq_num, mulligan_count, my_id, has_priority, priority_holder, opponent_id
 
     if "--verbose" in sys.argv or "-v" in sys.argv:
         set_verbose(True)
@@ -577,13 +592,14 @@ def main():
             print(f"\n[CLIENT] Not connected to the server ({disconnect_reason['text']}). Exiting.")
             break
 
-        print("\n--------------------")
-        _print_turn_status({
-            "phase": current_phase,
-            "active_player": active_player,
-            "priority_player": my_id if has_priority else opponent_id,
-            "turn": None,
-        })
+        with print_lock:
+            print("\n--------------------")
+            _print_turn_status({
+                "phase": current_phase,
+                "active_player": active_player,
+                "priority_player": priority_holder,
+                "turn": None,
+            })
         try:
             cmd = input("Command> ").strip()
         except EOFError:
@@ -654,6 +670,9 @@ def main():
                 continue
             if _safe_send(priotity_pass(pseq)):
                 print(f"[SENT] PRIORITY_PASS seq={pseq}")
+                with lock:
+                    has_priority = False
+                    priority_holder = opponent_id
 
         # ── PLAY shorthand ─────────────────────────────────────────
         elif action == "play":
@@ -677,6 +696,9 @@ def main():
                 payment = _mana_payment_for_card(card_id)
                 if _safe_send(cast_spell(card_id, targets, payment, pseq)):
                     print(f"[SENT] CAST_SPELL {card_id} targets={targets} mana={payment} seq={pseq}")
+                    with lock:
+                        has_priority = False
+                        priority_holder = opponent_id
 
         # ── PLAY_LAND ───────────────────────────────────────────────
         elif action == "land":
@@ -714,6 +736,9 @@ def main():
             payment = _mana_payment_for_card(card_id)
             if _safe_send(cast_spell(card_id, targets, payment, pseq)):
                 print(f"[SENT] CAST_SPELL {card_id} targets={targets} mana={payment} seq={pseq}")
+                with lock:
+                    has_priority = False
+                    priority_holder = opponent_id
 
         # ── ACTIVATE_ABILITY (tap land/creature for mana or damage) ───
         elif action == "tap":
@@ -739,6 +764,9 @@ def main():
                 continue
             if _safe_send(activate_ability(perm_id, 0, targets, pseq, cost)):
                 print(f"[SENT] ACTIVATE_ABILITY {perm_id} targets={targets}")
+                with lock:
+                    has_priority = False
+                    priority_holder = opponent_id
 
         # ── DECLARE_ATTACKERS ─────────────────────────────────────────
         elif action == "attack":
