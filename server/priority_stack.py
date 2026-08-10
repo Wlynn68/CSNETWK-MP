@@ -284,26 +284,31 @@ class PriorityStackEngine:
     # Phase / Turn Transitions
 
     def begin_turn(self):
-        # RFC 0001 s7.2: announce entry into UNTAP first (from whatever the
-        # previous phase actually was), *then* untap/reset, *then* announce
-        # the UNTAP -> UPKEEP transition. Untapping must never happen silently.
-        prev_phase = self.ctx.current_phase
-        self._broadcast_phase(prev_phase, "UNTAP")
-
+        """Start a new turn for the active player.
+        MTG turn structure: UNTAP -> UPKEEP -> DRAW -> PRECOMBAT_MAIN ->
+        BEGIN_COMBAT -> DECLARE_ATTACKERS -> DECLARE_BLOCKERS ->
+        COMBAT_DAMAGE -> END_OF_COMBAT -> POSTCOMBAT_MAIN -> END_STEP -> CLEANUP
+        """
         self.land_played_this_turn.clear()
         self._empty_mana_pools()
         active = self.ctx.active_player
+
+        # UNTAP STEP: no player receives priority during untap
+        self.ctx.current_phase = "UNTAP"
         self.untap_all(active)
         self._clear_summoning_sickness(active)
         self.ctx.broadcast_game_state()
 
+        # Move to UPKEEP and grant priority to active player
         self._broadcast_phase("UNTAP", "UPKEEP")
         self.passes_since_action = 0
         self.grant_priority(active)
 
     def _advance_from_upkeep(self):
         active = self.ctx.active_player
+        # DRAW STEP
         self._broadcast_phase("UPKEEP", "DRAW")
+        # Active player draws (skip on turn 1 per MTG rules)
         if self.ctx.turn_number > 1:
             pdata = self.ctx.game_data[active]
             if not pdata["library"]:
@@ -316,11 +321,31 @@ class PriorityStackEngine:
 
     def _advance_from_draw(self):
         active = self.ctx.active_player
+        # PRECOMBAT MAIN PHASE: lands and sorcery-speed spells allowed
         self._broadcast_phase("DRAW", "PRECOMBAT_MAIN")
-        self.ctx.current_phase = "PRECOMBAT_MAIN"
         self.passes_since_action = 0
         self.ctx.broadcast_game_state()
         self.grant_priority(active)
+
+    def _advance_to_postcombat_main(self):
+        active = self.ctx.active_player
+        self.combat_attackers.clear()
+        self.combat_blockers.clear()
+        self.damage_orders.clear()
+        self._broadcast_phase("END_OF_COMBAT", "POSTCOMBAT_MAIN")
+        self.passes_since_action = 0
+        self.ctx.broadcast_game_state()
+        self.grant_priority(active)
+
+    def _advance_to_end_step(self):
+        active = self.ctx.active_player
+        self._broadcast_phase("POSTCOMBAT_MAIN", "END_STEP")
+        self.passes_since_action = 0
+        self.grant_priority(active)
+
+    def _advance_to_cleanup(self):
+        self._broadcast_phase("END_STEP", "CLEANUP")
+        self._execute_cleanup()
 
     def _clear_summoning_sickness(self, pid: str):
         """Clear summoning sickness for all permanents controlled by pid at their Untap Step."""
@@ -337,7 +362,10 @@ class PriorityStackEngine:
                 perm["damage"] = 0
 
     def advance_after_both_pass(self):
+        """Both players passed with an empty stack. Advance to the next phase/step."""
         phase = self.ctx.current_phase
+        active = self.ctx.active_player
+
         if phase == "UPKEEP":
             self._advance_from_upkeep()
 
@@ -347,20 +375,17 @@ class PriorityStackEngine:
         elif phase == "PRECOMBAT_MAIN":
             self._broadcast_phase("PRECOMBAT_MAIN", "BEGIN_COMBAT")
             self.passes_since_action = 0
-            self.grant_priority(self.ctx.active_player)
+            self.grant_priority(active)
 
         elif phase == "BEGIN_COMBAT":
             self.last_phase_seq = self._broadcast_phase("BEGIN_COMBAT", "DECLARE_ATTACKERS")
             self.passes_since_action = 0
-            # Wait for Active Player DECLARE_ATTACKERS PDU
 
         elif phase == "DECLARE_ATTACKERS":
             self.last_phase_seq = self._broadcast_phase("DECLARE_ATTACKERS", "DECLARE_BLOCKERS")
             self.passes_since_action = 0
-            # Wait for Non-Active Player DECLARE_BLOCKERS PDU
 
         elif phase == "DECLARE_BLOCKERS":
-            # Check if multi-blocked attackers exist
             has_multi = False
             for att in self.combat_attackers:
                 att_id = att["creature_id"]
@@ -372,7 +397,6 @@ class PriorityStackEngine:
             if has_multi:
                 self.last_phase_seq = self._broadcast_phase("DECLARE_BLOCKERS", "ASSIGN_DAMAGE_ORDER")
                 self.passes_since_action = 0
-                # Wait for ASSIGN_DAMAGE_ORDER PDU
             else:
                 self._check_and_resolve_combat_damage()
 
@@ -382,25 +406,22 @@ class PriorityStackEngine:
         elif phase == "FIRST_STRIKE_DAMAGE":
             self._resolve_regular_combat_damage()
 
-        elif phase == "END_OF_COMBAT":
-            self.combat_attackers.clear()
-            self.combat_blockers.clear()
-            self.damage_orders.clear()
-            self._broadcast_phase("END_OF_COMBAT", "POSTCOMBAT_MAIN")
+        elif phase == "COMBAT_DAMAGE":
+            self._broadcast_phase("COMBAT_DAMAGE", "END_OF_COMBAT")
             self.passes_since_action = 0
-            self.grant_priority(self.ctx.active_player)
+            self.grant_priority(active)
+
+        elif phase == "END_OF_COMBAT":
+            self._advance_to_postcombat_main()
 
         elif phase == "POSTCOMBAT_MAIN":
-            self._broadcast_phase("POSTCOMBAT_MAIN", "END_STEP")
-            self.passes_since_action = 0
-            self.grant_priority(self.ctx.active_player)
+            self._advance_to_end_step()
 
         elif phase == "END_STEP":
-            self.last_phase_seq = self._broadcast_phase("END_STEP", "CLEANUP")
-            self._execute_cleanup()
+            self._advance_to_cleanup()
 
         else:
-            self.grant_priority(self.ctx.active_player)
+            self.grant_priority(active)
 
     def _broadcast_phase(self, frm: str, to: str) -> int:
         self.ctx.current_phase = to
@@ -543,7 +564,6 @@ class PriorityStackEngine:
         self.grant_priority(self.ctx.active_player)
 
     def _check_and_resolve_combat_damage(self):
-        # Check if first strike creatures exist
         has_first_strike = False
         all_participants = [a["creature_id"] for a in self.combat_attackers] + [b["creature_id"] for b in self.combat_blockers]
 
@@ -556,15 +576,20 @@ class PriorityStackEngine:
                     break
 
         if has_first_strike and self.ctx.current_phase != "FIRST_STRIKE_DAMAGE":
-            self._broadcast_phase("DECLARE_BLOCKERS", "FIRST_STRIKE_DAMAGE")
+            self._broadcast_phase(self.ctx.current_phase, "FIRST_STRIKE_DAMAGE")
             self._calculate_and_apply_combat_damage(first_strike_only=True)
             self.passes_since_action = 0
             self.grant_priority(self.ctx.active_player)
         else:
             self._broadcast_phase(self.ctx.current_phase, "COMBAT_DAMAGE")
-            self._resolve_regular_combat_damage()
+            self._calculate_and_apply_combat_damage(first_strike_only=False)
+            self._broadcast_phase("COMBAT_DAMAGE", "END_OF_COMBAT")
+            self.passes_since_action = 0
+            self.grant_priority(self.ctx.active_player)
 
     def _resolve_regular_combat_damage(self):
+        """Called when both pass in FIRST_STRIKE_DAMAGE — apply normal damage."""
+        self._broadcast_phase("FIRST_STRIKE_DAMAGE", "COMBAT_DAMAGE")
         self._calculate_and_apply_combat_damage(first_strike_only=False)
         self._broadcast_phase("COMBAT_DAMAGE", "END_OF_COMBAT")
         self.passes_since_action = 0
